@@ -5,6 +5,9 @@
 
 ## Компилятор (как приложение переводить в ЕХЕ)
 **Шаг 1.** Установить PyInstaller (если не установлен)
+
 **Шаг 2.** Открыть Terminal (alt + F12)
+
 **Шаг 3.** Собрать EXE. Ввести в Terminal: pyinstaller --onefile --windowed --name PDF_Contents_Extractor PDF_Contents_Extractor.py
+
 **Шаг 3.** Найти готовый файл в папке dist
