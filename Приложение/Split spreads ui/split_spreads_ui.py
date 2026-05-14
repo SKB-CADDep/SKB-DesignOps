@@ -9,7 +9,14 @@ from pypdf.generic import RectangleObject
 import fitz  # PyMuPDF
 
 STEP_PX = 5
-PREVIEW_ZOOM = 1.2
+
+MIN_PREVIEW_ZOOM = 0.80
+MAX_PREVIEW_ZOOM = 1.60
+DEFAULT_PREVIEW_ZOOM = 1.20
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
 
 
 def _norm_rot(deg: int) -> int:
@@ -225,6 +232,7 @@ class App(tk.Tk):
         self._doc = None
         self._page_count = 0
         self._tk_img = None
+        self.preview_zoom_var = tk.DoubleVar(value=DEFAULT_PREVIEW_ZOOM)
 
         self._offsets: list[int] = []
         self._skips: list[bool] = []
@@ -234,6 +242,7 @@ class App(tk.Tk):
         self._page_rotations: list[int] = []  # 0/90/180/270
 
         self._build_ui()
+        self._apply_auto_preview_zoom()
 
     def _build_ui(self):
         top = tk.Frame(self)
@@ -313,6 +322,27 @@ class App(tk.Tk):
         self.rot_label.pack(side="left", padx=10)
 
         mid = tk.Frame(self)
+        zoom_row = tk.Frame(top)
+        zoom_row.pack(fill="x", pady=(8, 0))
+
+        tk.Label(zoom_row, text="Масштаб предпросмотра:").pack(side="left")
+
+        self.zoom_scale = tk.Scale(
+            zoom_row,
+            from_=MIN_PREVIEW_ZOOM,
+            to=MAX_PREVIEW_ZOOM,
+            resolution=0.05,
+            orient="horizontal",
+            variable=self.preview_zoom_var,
+            length=240,
+            command=self._on_preview_zoom_change,
+        )
+        self.zoom_scale.pack(side="left", padx=8)
+
+        tk.Button(zoom_row, text="Авто", command=self._apply_auto_preview_zoom).pack(side="left")
+
+        self.zoom_value_label = tk.Label(zoom_row, text=f"{self.preview_zoom_var.get():.2f}x")
+        self.zoom_value_label.pack(side="left", padx=8)
         mid.pack(side="top", fill="both", expand=True, padx=10, pady=8)
 
         left_panel = tk.Frame(mid, width=420)
@@ -419,6 +449,25 @@ class App(tk.Tk):
             return _norm_rot(self._page_rotations[i])
         return _norm_rot(self.global_rotation_var.get())
 
+    def _calc_monitor_diagonal_inches(self) -> float:
+        mm_w = max(1, self.winfo_screenmmwidth())
+        mm_h = max(1, self.winfo_screenmmheight())
+        return ((mm_w / 25.4) ** 2 + (mm_h / 25.4) ** 2) ** 0.5
+
+    def _calc_auto_preview_zoom(self) -> float:
+        diag_in = self._calc_monitor_diagonal_inches()
+        zoom = diag_in / 15.6
+        return round(_clamp(zoom, MIN_PREVIEW_ZOOM, MAX_PREVIEW_ZOOM), 2)
+
+    def _apply_auto_preview_zoom(self):
+        self.preview_zoom_var.set(self._calc_auto_preview_zoom())
+        self._update_labels()
+        self.refresh_preview()
+
+    def _on_preview_zoom_change(self, _value=None):
+        self._update_labels()
+        self.refresh_preview()
+
     def reset_selection(self):
         try:
             if self._doc is not None:
@@ -516,6 +565,8 @@ class App(tk.Tk):
             self.page_label.config(text=f"Стр.: {self.page_index_var.get() + 1} / {self._page_count}")
         else:
             self.page_label.config(text="Стр.: - / -")
+        if hasattr(self, "zoom_value_label"):
+            self.zoom_value_label.config(text=f"{self.preview_zoom_var.get():.2f}x")
 
     # -------- UI actions --------
     def choose_input(self):
@@ -687,7 +738,9 @@ class App(tk.Tk):
 
         # Рендерим с эффективным user_rotation для этой страницы (глобальный или индивидуальный)
         rot_for_page = self._effective_user_rotation_for_page(idx)
-        mat = fitz.Matrix(PREVIEW_ZOOM, PREVIEW_ZOOM).prerotate(rot_for_page)
+        preview_zoom = float(self.preview_zoom_var.get())
+        preview_zoom = float(self.preview_zoom_var.get())
+        mat = fitz.Matrix(preview_zoom, preview_zoom).prerotate(rot_for_page)
         pix = page.get_pixmap(matrix=mat, alpha=False)
 
         self._tk_img = tk.PhotoImage(data=pix.tobytes("ppm"))
@@ -742,7 +795,7 @@ class App(tk.Tk):
                 output_path=out_path,
                 output_mode=mode,
                 global_rotation=int(self.global_rotation_var.get()),
-                preview_zoom=float(PREVIEW_ZOOM),
+                preview_zoom=float(self.preview_zoom_var.get()),
                 per_page_offset_px=list(self._offsets),
                 per_page_skip=list(self._skips),
                 per_page_use_rotation=list(self._use_page_rotation),
