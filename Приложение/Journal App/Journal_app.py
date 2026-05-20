@@ -1,6 +1,7 @@
 import sys
 import os
 import re
+import shutil
 import sqlite3
 import getpass
 from datetime import datetime
@@ -15,7 +16,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QInputDialog, QHeaderView
 )
 from PySide6.QtGui import QColor
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QThread, Signal
 
 import pandas as pd
 
@@ -44,6 +45,11 @@ MONTH_NAMES_RU = {
 # Общая БД на файловом сервере
 DB_DIR = Path(r"\\fileserver\УТЗ\10 Служба технического директора\05 СКБт\!Общая\Сканы для ГПЯ\!Обработка документов\Журналы")
 DB_PATH = str(DB_DIR / "journal_app.db")
+
+# Резервная копия БД
+DB_BACKUP_DIR = DB_DIR / "_backup"
+DB_BACKUP_PATH = DB_BACKUP_DIR / "journal_app_backup.db"
+BACKUP_DELAY_MS = 2_000  # небольшая задержка, чтобы склеивать серию правок в один бэкап
 
 CURRENT_USER = getpass.getuser()
 
@@ -266,6 +272,68 @@ def get_db_connection():
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
+def restore_db_from_backup_if_needed():
+    """
+    Если основная БД удалена, но есть резервная копия,
+    восстанавливаем её до запуска приложения.
+    """
+    if Path(DB_PATH).exists() or not DB_BACKUP_PATH.exists():
+        return False
+
+    ensure_db_dir()
+    DB_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+    try:
+        shutil.copy2(DB_BACKUP_PATH, DB_PATH)
+    except OSError as exc:
+        raise sqlite3.OperationalError(
+            f"Не удалось восстановить БД из резервной копии: {exc}"
+        ) from exc
+
+    return True
+
+
+class DatabaseBackupThread(QThread):
+    backup_finished = Signal(bool, str)
+
+    def run(self):
+        temp_path = DB_BACKUP_PATH.with_name(DB_BACKUP_PATH.name + ".tmp")
+
+        try:
+            source_path = Path(DB_PATH)
+            if not source_path.exists():
+                raise FileNotFoundError(f"Не найдена исходная БД: {source_path}")
+
+            DB_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+            if temp_path.exists():
+                temp_path.unlink()
+
+            source = sqlite3.connect(DB_PATH, timeout=5)
+            source.execute("PRAGMA busy_timeout = 5000")
+
+            destination = sqlite3.connect(str(temp_path), timeout=5)
+            try:
+                # Делает консистентную копию БД без блокировки UI
+                source.backup(destination, pages=200, sleep=0.05)
+                destination.commit()
+            finally:
+                destination.close()
+                source.close()
+
+            os.replace(temp_path, DB_BACKUP_PATH)
+            self.backup_finished.emit(True, str(DB_BACKUP_PATH))
+
+        except Exception as exc:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except OSError:
+                pass
+
+            self.backup_finished.emit(False, str(exc))
+
+
 def extract_issue_metadata_from_pdf(pdf_path):
     pdf_path = Path(pdf_path)
     parents = list(pdf_path.parents)
@@ -354,6 +422,15 @@ class MainWindow(QMainWindow):
         self._preserve_scroll_on_reload = False
         self._preserve_export_scroll_on_reload = False
 
+        self._backup_enabled = True
+        self._backup_requested = False
+        self.backup_thread = None
+
+        self.backup_timer = QTimer(self)
+        self.backup_timer.setSingleShot(True)
+        self.backup_timer.setInterval(BACKUP_DELAY_MS)
+        self.backup_timer.timeout.connect(self.start_backup_thread)
+
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
 
@@ -373,6 +450,19 @@ class MainWindow(QMainWindow):
         self.load_export_data()
         self.remember_db_signature()
         self.refresh_timer.start()
+
+    def closeEvent(self, event):
+        self.backup_timer.stop()
+
+        # Если есть ожидающий бэкап — запускаем его перед закрытием
+        if self._backup_requested and not (self.backup_thread and self.backup_thread.isRunning()):
+            self.start_backup_thread()
+
+        # Дожидаемся завершения текущего бэкапа, чтобы не потерять последние изменения
+        if self.backup_thread and self.backup_thread.isRunning():
+            self.backup_thread.wait(5000)
+
+        super().closeEvent(event)
 
     def sync_from_network(self):
         if not self.is_admin:
@@ -500,33 +590,62 @@ class MainWindow(QMainWindow):
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("""
-            SELECT taken_by, COUNT(*) AS cnt
+            SELECT taken_by,
+                   COUNT(*) AS cnt,
+                   MIN(completed_at) AS first_done_at,
+                   MIN(id) AS first_issue_id
             FROM issues
             WHERE status='done'
               AND completed_at LIKE ?
               AND taken_by IS NOT NULL
               AND TRIM(taken_by) != ''
             GROUP BY taken_by
-            ORDER BY cnt DESC, taken_by COLLATE NOCASE
+            ORDER BY cnt DESC, first_done_at ASC, first_issue_id ASC
         """, (month_str + "%",))
         rows = cur.fetchall()
         conn.close()
-        return rows
+
+        return [(taken_by, cnt) for taken_by, cnt, _, _ in rows]
 
     def format_month_ranking_text(self, ranking_rows):
         if not ranking_rows:
             return "Нет завершенных журналов"
 
+        def format_place(place: int) -> str:
+            if place == 1:
+                return "🥇 1 место"
+            if place == 2:
+                return "🥈 2 место"
+            if place == 3:
+                return "🥉 3 место"
+            return f"{place} место"
+
         lines = []
-        for index, (user, count) in enumerate(ranking_rows, start=1):
-            if index == 1:
-                lines.append(f"🥇 {index} место — {user} ({count})")
-            elif index == 2:
-                lines.append(f"🥈 {index} место — {user} ({count})")
-            elif index == 3:
-                lines.append(f"🥉 {index} место — {user} ({count})")
+        current_place = 1
+        current_count = None
+        current_users = []
+
+        def flush_group(place, users, count):
+            if not users:
+                return
+            users_text = "; ".join(f"{user} ({count})" for user in users)
+            lines.append(f"{format_place(place)} — {users_text}")
+
+        for user, count in ranking_rows:
+            if current_count is None:
+                current_count = count
+                current_users = [user]
+                continue
+
+            if count == current_count:
+                current_users.append(user)
             else:
-                lines.append(f"{index} место — {user} ({count})")
+                flush_group(current_place, current_users, current_count)
+                current_place += 1
+                current_count = count
+                current_users = [user]
+
+        flush_group(current_place, current_users, current_count)
 
         return "\n".join(lines)
 
@@ -569,8 +688,38 @@ class MainWindow(QMainWindow):
     def remember_db_signature(self):
         try:
             self.last_db_signature = self.get_db_signature()
+            if self._backup_enabled:
+                self.schedule_backup()
         except sqlite3.OperationalError:
             self.last_db_signature = None
+
+    def schedule_backup(self):
+        self._backup_requested = True
+        self.backup_timer.start(BACKUP_DELAY_MS)
+
+    def start_backup_thread(self):
+        if not self._backup_requested:
+            return
+
+        if self.backup_thread and self.backup_thread.isRunning():
+            return
+
+        self._backup_requested = False
+        self.backup_thread = DatabaseBackupThread()
+        self.backup_thread.backup_finished.connect(self.on_backup_finished)
+        self.backup_thread.start()
+
+    def on_backup_finished(self, success, message):
+        if self.backup_thread is not None:
+            self.backup_thread.deleteLater()
+            self.backup_thread = None
+
+        if not success:
+            print(f"Ошибка резервного копирования: {message}")
+
+        # Если пока копировали пришли новые изменения — ставим ещё один бэкап
+        if self._backup_requested:
+            self.backup_timer.start(BACKUP_DELAY_MS)
 
     def refresh_ui(self):
         if not self.isVisible():
@@ -2735,6 +2884,7 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     try:
+        restore_db_from_backup_if_needed()
         init_db()
     except sqlite3.OperationalError as exc:
         app = QApplication(sys.argv)
