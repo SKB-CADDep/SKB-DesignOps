@@ -75,5 +75,6 @@
 6. Закрыть программу: прогресс отметок и данные сохраняются в общей базе.
 ---
 
-<img width="1499" height="946" alt="2026-07-27_10-25-18" src="https://github.com/user-attachments/assets/75767c5a-c8b9-45c9-a342-6e603b13cdbf" />
+<img width="1499" height="946" alt="2026-07-27_10-25-18" src="https://github.com/user-attachments/assets/7c5abd9e-3e4d-4746-8a09-7ecbafa072ac" />
+
 
