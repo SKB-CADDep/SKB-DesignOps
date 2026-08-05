@@ -14,7 +14,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QTableWidget, QTableWidgetItem,
     QPushButton, QLabel, QComboBox, QMessageBox,
     QTabWidget, QFileDialog, QProgressBar, QLineEdit, QSpinBox, QFrame,
-    QAbstractItemView, QInputDialog, QHeaderView, QListWidget, QDialog
+    QAbstractItemView, QInputDialog, QHeaderView, QListWidget, QDialog,
+    QButtonGroup, QRadioButton,
 )
 from PySide6.QtGui import QColor
 from PySide6.QtCore import Qt, QTimer
@@ -28,7 +29,26 @@ class NoWheelComboBox(QComboBox):
 
 
 ISSUES_TEXT_FIT_COLUMNS = (0, 1, 2)
-ISSUES_TABLE_COLUMN_COMPLETED_AT = 9
+ISSUES_TABLE_COLUMN_COMPLETED_AT = 12
+ISSUES_TABLE_COLUMN_FINAL_REVIEWER = 9
+ISSUES_TABLE_COLUMN_FINAL_REVIEW_ACTION = 10
+ISSUES_TABLE_COLUMN_FINAL_REVIEW_STATUS = 11
+
+ISSUES_TABLE_HEADERS = [
+    "Журнал",
+    "Год",
+    "Выпуск",
+    "Статус",
+    "Кто",
+    "Действие",
+    "Кто проверил",
+    "Проверка",
+    "Статус проверки",
+    "Кто финально проверил",
+    "Финальная проверка",
+    "Статус фин. проверки",
+    "Дата готовности",
+]
 
 ISSUES_TABLE_FIXED_COLUMN_SAMPLES = {
     3: ["⚪ Свободен", "🟡 В работе", "✅ Готово"],
@@ -37,7 +57,10 @@ ISSUES_TABLE_FIXED_COLUMN_SAMPLES = {
     6: ["nyagavrilova", "Кто проверил"],
     7: ["Взять на проверку", "Проверено", "—"],
     8: ["⚪ Свободно", "🟡 На проверке", "✅ Проверено"],
-    9: ["30.06.2026", "01.07.2026"],
+    9: ["nyagavrilova", "Кто финально проверил"],
+    10: ["Взять на фин. проверку", "Финально проверено", "—"],
+    11: ["⚪ Свободно", "🟡 На фин. проверке", "✅ Финально проверено"],
+    12: ["30.06.2026", "01.07.2026"],
 }
 
 ISSUES_TABLE_COLUMN_EXTRA_PADDING = {
@@ -45,6 +68,8 @@ ISSUES_TABLE_COLUMN_EXTRA_PADDING = {
     5: 24,
     7: 24,
     8: 36,
+    10: 24,
+    11: 36,
 }
 
 RATING_PROGRESS_COLUMN_SAMPLES = [
@@ -55,6 +80,25 @@ RATING_PROGRESS_COLUMN_SAMPLES = [
     ["12345", "На проверку, шт"],
     ["12345", "Проверено, шт"],
     ["100%", "Проверено, %"],
+    ["12345", "На фин. проверку, шт"],
+    ["12345", "Фин. проверка, шт"],
+    ["100%", "Фин. проверка, %"],
+]
+
+RATING_PROGRESS_BASE_HEADERS = [
+    "Журнал",
+    "Всего, шт",
+    "Выгружено, шт",
+    "Выгружено, %",
+    "На проверку, шт",
+    "Проверено, шт",
+    "Проверено, %",
+]
+
+RATING_PROGRESS_FINAL_HEADERS = [
+    "На фин. проверку, шт",
+    "Фин. проверка, шт",
+    "Фин. проверка, %",
 ]
 
 ISSUES_REPORT_COLUMNS = [
@@ -66,7 +110,24 @@ ISSUES_REPORT_COLUMNS = [
     ("completed_at", "Дата готовности"),
     ("review_taken_by", "Кто проверил"),
     ("review_status", "Статус проверки"),
+    ("final_review_taken_by", "Кто финально проверил"),
+    ("final_review_status", "Статус фин. проверки"),
 ]
+
+FINAL_REVIEW_CLEAR_SQL = """
+    final_review_status='free',
+    final_review_taken_by=NULL,
+    final_review_taken_at=NULL,
+    final_review_completed_at=NULL
+"""
+
+REVIEW_AND_FINAL_CLEAR_SQL = f"""
+    review_status='free',
+    review_taken_by=NULL,
+    review_taken_at=NULL,
+    review_completed_at=NULL,
+    {FINAL_REVIEW_CLEAR_SQL}
+"""
 
 ISSUE_STATUS_TEXTS = {
     "free": "⚪ Свободен",
@@ -194,6 +255,12 @@ REVIEW_STATUS_SEARCH_TEXTS = {
     "done": ("done", "проверено", "✅ проверено"),
 }
 
+FINAL_REVIEW_STATUS_SEARCH_TEXTS = {
+    "free": ("free", "фин свободно", "финальная свободна", "⚪ свободно"),
+    "in_progress": ("in_progress", "на фин. проверке", "на финальной проверке", "🟡 на фин. проверке"),
+    "done": ("done", "финально проверено", "✅ финально проверено"),
+}
+
 
 def build_issue_search_text(
     journal="",
@@ -204,10 +271,13 @@ def build_issue_search_text(
     taken_by="",
     review_status=None,
     review_taken_by="",
+    final_review_status=None,
+    final_review_taken_by="",
 ):
     """Текст строки для текстового поиска (без дат — для них отдельный фильтр)."""
     status_key = status or ""
     review_key = review_status or "free"
+    final_review_key = final_review_status or "free"
     parts = [
         str(journal or ""),
         str(year or ""),
@@ -217,6 +287,8 @@ def build_issue_search_text(
         str(taken_by or ""),
         *REVIEW_STATUS_SEARCH_TEXTS.get(review_key, (str(review_key),)),
         str(review_taken_by or ""),
+        *FINAL_REVIEW_STATUS_SEARCH_TEXTS.get(final_review_key, (str(final_review_key),)),
+        str(final_review_taken_by or ""),
     ]
     return " ".join(parts).casefold()
 
@@ -249,6 +321,10 @@ def filter_issue_rows(rows, search_text, with_path=False):
                 review_taken_by,
                 _review_taken_at,
                 _review_completed_at,
+                final_review_status,
+                final_review_taken_by,
+                _final_review_taken_at,
+                _final_review_completed_at,
             ) = row_data
         else:
             (
@@ -264,6 +340,10 @@ def filter_issue_rows(rows, search_text, with_path=False):
                 review_taken_by,
                 _review_taken_at,
                 _review_completed_at,
+                final_review_status,
+                final_review_taken_by,
+                _final_review_taken_at,
+                _final_review_completed_at,
             ) = row_data
             path = ""
 
@@ -277,6 +357,8 @@ def filter_issue_rows(rows, search_text, with_path=False):
             taken_by=taken_by,
             review_status=review_status,
             review_taken_by=review_taken_by,
+            final_review_status=final_review_status,
+            final_review_taken_by=final_review_taken_by,
         ):
             filtered.append(row_data)
     return filtered
@@ -369,7 +451,7 @@ MONTH_NAMES_RU = {
     12: "Декабрь",
 }
 
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.4"
 VERSIONS_DIR_NAME = "versions"
 VERSION_CONFIG_NAME = "version.json"
 UPDATE_CHECK_INTERVAL_MS = 5 * 60 * 1000
@@ -486,6 +568,10 @@ def init_db():
         review_taken_by TEXT,
         review_taken_at TEXT,
         review_completed_at TEXT,
+        final_review_status TEXT DEFAULT 'free',
+        final_review_taken_by TEXT,
+        final_review_taken_at TEXT,
+        final_review_completed_at TEXT,
         updated_at TEXT
     )
     """)
@@ -504,6 +590,10 @@ def init_db():
         review_taken_by TEXT,
         review_taken_at TEXT,
         review_completed_at TEXT,
+        final_review_status TEXT DEFAULT 'free',
+        final_review_taken_by TEXT,
+        final_review_taken_at TEXT,
+        final_review_completed_at TEXT,
         updated_at TEXT,
         UNIQUE(journal, year, issue)
     )
@@ -528,6 +618,14 @@ def init_db():
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS reviewers (
+        username TEXT PRIMARY KEY,
+        added_by TEXT,
+        updated_at TEXT
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS final_reviewers (
         username TEXT PRIMARY KEY,
         added_by TEXT,
         updated_at TEXT
@@ -581,6 +679,10 @@ def init_db():
         "review_taken_by": "TEXT",
         "review_taken_at": "TEXT",
         "review_completed_at": "TEXT",
+        "final_review_status": "TEXT DEFAULT 'free'",
+        "final_review_taken_by": "TEXT",
+        "final_review_taken_at": "TEXT",
+        "final_review_completed_at": "TEXT",
     }.items():
         if column_name not in issue_columns:
             cur.execute(f"ALTER TABLE issues ADD COLUMN {column_name} {column_sql}")
@@ -592,6 +694,10 @@ def init_db():
         "review_taken_by": "TEXT",
         "review_taken_at": "TEXT",
         "review_completed_at": "TEXT",
+        "final_review_status": "TEXT DEFAULT 'free'",
+        "final_review_taken_by": "TEXT",
+        "final_review_taken_at": "TEXT",
+        "final_review_completed_at": "TEXT",
     }.items():
         if column_name not in export_issue_columns:
             cur.execute(f"ALTER TABLE export_issues ADD COLUMN {column_name} {column_sql}")
@@ -721,6 +827,31 @@ def init_db():
     END;
     """)
 
+    cur.execute("""
+    CREATE TRIGGER IF NOT EXISTS trg_final_reviewers_ai
+    AFTER INSERT ON final_reviewers
+    BEGIN
+        INSERT INTO change_log(table_name, row_id, action, created_at)
+        VALUES ('final_reviewers', NULL, 'I', datetime('now'));
+    END;
+    """)
+    cur.execute("""
+    CREATE TRIGGER IF NOT EXISTS trg_final_reviewers_au
+    AFTER UPDATE ON final_reviewers
+    BEGIN
+        INSERT INTO change_log(table_name, row_id, action, created_at)
+        VALUES ('final_reviewers', NULL, 'U', datetime('now'));
+    END;
+    """)
+    cur.execute("""
+    CREATE TRIGGER IF NOT EXISTS trg_final_reviewers_ad
+    AFTER DELETE ON final_reviewers
+    BEGIN
+        INSERT INTO change_log(table_name, row_id, action, created_at)
+        VALUES ('final_reviewers', NULL, 'D', datetime('now'));
+    END;
+    """)
+
     # Индексы для ускорения запросов
     cur.execute("CREATE INDEX IF NOT EXISTS idx_issues_status ON issues(status)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_issues_taken_by ON issues(taken_by)")
@@ -728,12 +859,16 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_issues_completed_at ON issues(completed_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_issues_review_status ON issues(review_status)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_issues_review_taken_by ON issues(review_taken_by)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_issues_final_review_status ON issues(final_review_status)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_issues_final_review_taken_by ON issues(final_review_taken_by)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_export_issues_status ON export_issues(status)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_export_issues_taken_by ON export_issues(taken_by)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_export_issues_journal ON export_issues(journal)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_export_issues_completed_at ON export_issues(completed_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_export_issues_review_status ON export_issues(review_status)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_export_issues_review_taken_by ON export_issues(review_taken_by)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_export_issues_final_review_status ON export_issues(final_review_status)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_export_issues_final_review_taken_by ON export_issues(final_review_taken_by)")
 
     conn.commit()
     conn.close()
@@ -913,6 +1048,7 @@ class MainWindow(QMainWindow):
 
         self.is_admin = CURRENT_USER in ADMIN_USERS
         self.is_reviewer = self.user_is_reviewer(CURRENT_USER)
+        self.is_final_reviewer = self.user_is_final_reviewer(CURRENT_USER)
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
         self.search_timer.setInterval(300)
@@ -1058,6 +1194,23 @@ class MainWindow(QMainWindow):
         conn.close()
         return exists
 
+    def user_is_final_reviewer(self, username):
+        if not username:
+            return False
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM final_reviewers WHERE LOWER(username)=LOWER(?)",
+            (username.strip(),)
+        )
+        exists = cur.fetchone() is not None
+        conn.close()
+        return exists
+
+    def can_see_final_review_stats(self):
+        return self.is_admin or self.is_final_reviewer
+
     def load_reviewers(self):
         conn = get_db_connection()
         cur = conn.cursor()
@@ -1066,13 +1219,25 @@ class MainWindow(QMainWindow):
         conn.close()
         return reviewers
 
-    def refresh_reviewers_list(self):
-        if not self.is_admin or not getattr(self, "reviewers_list", None):
-            return
+    def load_final_reviewers(self):
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT username FROM final_reviewers ORDER BY username COLLATE NOCASE")
+        reviewers = [row[0] for row in cur.fetchall()]
+        conn.close()
+        return reviewers
 
-        self.reviewers_list.clear()
-        self.reviewers_list.addItems(self.load_reviewers())
+    def refresh_reviewers_list(self):
         self.is_reviewer = self.user_is_reviewer(CURRENT_USER)
+        self.is_final_reviewer = self.user_is_final_reviewer(CURRENT_USER)
+
+        if self.is_admin and getattr(self, "reviewers_list", None):
+            self.reviewers_list.clear()
+            self.reviewers_list.addItems(self.load_reviewers())
+
+        if self.is_admin and getattr(self, "final_reviewers_list", None):
+            self.final_reviewers_list.clear()
+            self.final_reviewers_list.addItems(self.load_final_reviewers())
 
     def get_review_action_button(self, issue_id, status, review_status, review_taken_by, is_export=False):
         btn = QPushButton()
@@ -1134,6 +1299,79 @@ class MainWindow(QMainWindow):
 
         return btn
 
+    def get_final_review_action_button(
+        self,
+        issue_id,
+        review_status,
+        final_review_status,
+        final_review_taken_by,
+        is_export=False,
+    ):
+        btn = QPushButton()
+        review_done = (review_status or "free") == "done"
+        final_status = final_review_status or "free"
+
+        if (
+            self.is_final_reviewer
+            and review_done
+            and final_status == "free"
+        ):
+            btn.setText("Взять на фин. проверку")
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #0d6efd;
+                    color: white;
+                    font-weight: 600;
+                    border-radius: 6px;
+                    padding: 4px 8px;
+                }
+                QPushButton:hover {
+                    background-color: #0b5ed7;
+                }
+            """)
+            btn.clicked.connect(
+                lambda _, i=issue_id: self.take_final_review_issue(i, is_export=is_export)
+            )
+        elif (
+            self.is_final_reviewer
+            and review_done
+            and final_status == "in_progress"
+            and final_review_taken_by == CURRENT_USER
+        ):
+            btn.setText("Финально проверено")
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #198754;
+                    color: white;
+                    font-weight: 600;
+                    border-radius: 6px;
+                    padding: 4px 8px;
+                }
+                QPushButton:hover {
+                    background-color: #157347;
+                }
+            """)
+            btn.clicked.connect(
+                lambda _, i=issue_id: self.confirm_final_review_complete(i, is_export=is_export)
+            )
+        else:
+            btn.setText("—")
+            btn.setEnabled(False)
+            if not self.is_final_reviewer:
+                btn.setToolTip(
+                    "Кнопка доступна только пользователям из списка проверяющих 2 уровня."
+                )
+            elif not review_done:
+                btn.setToolTip("Финальную проверку можно взять только после проверки 1 уровня.")
+            elif final_status == "done":
+                btn.setToolTip("Запись уже прошла финальную проверку.")
+            elif final_status == "in_progress" and final_review_taken_by:
+                btn.setToolTip(
+                    f"Запись уже на финальной проверке у пользователя {final_review_taken_by}."
+                )
+
+        return btn
+
     def get_review_status_text(self, review_status, status=None):
         if status != "done":
             return "—"
@@ -1141,6 +1379,15 @@ class MainWindow(QMainWindow):
             return "🟡 На проверке"
         if review_status == "done":
             return "✅ Проверено"
+        return "⚪ Свободно"
+
+    def get_final_review_status_text(self, final_review_status, review_status=None):
+        if (review_status or "free") != "done":
+            return "—"
+        if final_review_status == "in_progress":
+            return "🟡 На фин. проверке"
+        if final_review_status == "done":
+            return "✅ Финально проверено"
         return "⚪ Свободно"
 
     def get_review_status_combo(self, issue_id, review_status, is_export=False):
@@ -1152,6 +1399,22 @@ class MainWindow(QMainWindow):
         combo.setCurrentIndex(idx if idx >= 0 else 0)
         combo.currentIndexChanged.connect(
             lambda _, row_id=issue_id, widget=combo: self.change_review_status(
+                row_id,
+                widget.currentData(),
+                is_export=is_export
+            )
+        )
+        return combo
+
+    def get_final_review_status_combo(self, issue_id, final_review_status, is_export=False):
+        combo = NoWheelComboBox()
+        combo.addItem("⚪ Свободно", "free")
+        combo.addItem("🟡 На фин. проверке", "in_progress")
+        combo.addItem("✅ Финально проверено", "done")
+        idx = combo.findData(final_review_status or "free")
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.currentIndexChanged.connect(
+            lambda _, row_id=issue_id, widget=combo: self.change_final_review_status(
                 row_id,
                 widget.currentData(),
                 is_export=is_export
@@ -1182,6 +1445,83 @@ class MainWindow(QMainWindow):
             review_status_item.setData(Qt.BackgroundRole, None)
 
         table.setItem(row, 8, review_status_item)
+
+    def set_final_review_status_cell(
+        self,
+        table,
+        row,
+        issue_id,
+        review_status,
+        final_review_status,
+        is_export=False,
+    ):
+        table.removeCellWidget(row, ISSUES_TABLE_COLUMN_FINAL_REVIEW_STATUS)
+
+        if (review_status or "free") == "done" and self.is_admin:
+            table.setCellWidget(
+                row,
+                ISSUES_TABLE_COLUMN_FINAL_REVIEW_STATUS,
+                self.get_final_review_status_combo(
+                    issue_id,
+                    final_review_status,
+                    is_export=is_export,
+                ),
+            )
+            return
+
+        item = table.item(row, ISSUES_TABLE_COLUMN_FINAL_REVIEW_STATUS) or QTableWidgetItem()
+        item.setText(self.get_final_review_status_text(final_review_status, review_status))
+        item.setData(Qt.UserRole, issue_id)
+
+        if (review_status or "free") == "done" and final_review_status == "in_progress":
+            item.setBackground(QColor("#fff3cd"))
+        elif (review_status or "free") == "done" and final_review_status == "done":
+            item.setBackground(QColor("#d4edda"))
+        else:
+            item.setData(Qt.BackgroundRole, None)
+
+        table.setItem(row, ISSUES_TABLE_COLUMN_FINAL_REVIEW_STATUS, item)
+
+    def set_final_review_cells(
+        self,
+        table,
+        row,
+        issue_id,
+        review_status,
+        final_review_status,
+        final_review_taken_by,
+        is_export=False,
+    ):
+        reviewer_item = table.item(row, ISSUES_TABLE_COLUMN_FINAL_REVIEWER) or QTableWidgetItem()
+        reviewer_item.setText(final_review_taken_by or "")
+        reviewer_item.setData(Qt.UserRole, issue_id)
+        if final_review_status == "in_progress":
+            reviewer_item.setBackground(QColor("#fff3cd"))
+        elif final_review_status == "done":
+            reviewer_item.setBackground(QColor("#d4edda"))
+        else:
+            reviewer_item.setData(Qt.BackgroundRole, None)
+        table.setItem(row, ISSUES_TABLE_COLUMN_FINAL_REVIEWER, reviewer_item)
+
+        table.setCellWidget(
+            row,
+            ISSUES_TABLE_COLUMN_FINAL_REVIEW_ACTION,
+            self.get_final_review_action_button(
+                issue_id,
+                review_status,
+                final_review_status,
+                final_review_taken_by,
+                is_export=is_export,
+            ),
+        )
+        self.set_final_review_status_cell(
+            table,
+            row,
+            issue_id,
+            review_status,
+            final_review_status,
+            is_export=is_export,
+        )
 
     def set_completed_at_cell(self, table, row, issue_id, completed_at, status):
         if not self.is_admin:
@@ -1249,6 +1589,7 @@ class MainWindow(QMainWindow):
                     review_taken_by=NULL,
                     review_taken_at=NULL,
                     review_completed_at=NULL,
+                    {FINAL_REVIEW_CLEAR_SQL},
                     updated_at=?
                 WHERE id=?
             """, (now, issue_id))
@@ -1272,6 +1613,7 @@ class MainWindow(QMainWindow):
                     review_taken_by=?,
                     review_taken_at=?,
                     review_completed_at=NULL,
+                    {FINAL_REVIEW_CLEAR_SQL},
                     updated_at=?
                 WHERE id=?
             """, (
@@ -1322,6 +1664,107 @@ class MainWindow(QMainWindow):
             self.refresh_issue_row(issue_id)
         self.remember_db_signature()
 
+    def change_final_review_status(self, issue_id, final_review_status, is_export=False):
+        if not self.is_admin:
+            return
+
+        table_name = "export_issues" if is_export else "issues"
+        now = datetime.now().isoformat()
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT review_status, final_review_taken_by, final_review_taken_at
+            FROM {table_name}
+            WHERE id=?
+            """,
+            (issue_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return
+
+        review_status, final_review_taken_by, final_review_taken_at = row
+
+        if final_review_status == "free":
+            cur.execute(f"""
+                UPDATE {table_name}
+                SET {FINAL_REVIEW_CLEAR_SQL},
+                    updated_at=?
+                WHERE id=?
+            """, (now, issue_id))
+        elif final_review_status == "in_progress":
+            if (review_status or "free") != "done":
+                conn.close()
+                QMessageBox.warning(
+                    self,
+                    "Внимание",
+                    "Финальную проверку можно начать только после проверки 1 уровня."
+                )
+                if is_export:
+                    self.refresh_export_issue_row(issue_id)
+                else:
+                    self.refresh_issue_row(issue_id)
+                return
+
+            cur.execute(f"""
+                UPDATE {table_name}
+                SET final_review_status='in_progress',
+                    final_review_taken_by=?,
+                    final_review_taken_at=?,
+                    final_review_completed_at=NULL,
+                    updated_at=?
+                WHERE id=?
+            """, (
+                final_review_taken_by or CURRENT_USER,
+                final_review_taken_at or now,
+                now,
+                issue_id,
+            ))
+        elif final_review_status == "done":
+            if (review_status or "free") != "done":
+                conn.close()
+                QMessageBox.warning(
+                    self,
+                    "Внимание",
+                    "Финально проверить можно только записи после проверки 1 уровня."
+                )
+                if is_export:
+                    self.refresh_export_issue_row(issue_id)
+                else:
+                    self.refresh_issue_row(issue_id)
+                return
+
+            cur.execute(f"""
+                UPDATE {table_name}
+                SET final_review_status='done',
+                    final_review_taken_by=?,
+                    final_review_taken_at=?,
+                    final_review_completed_at=?,
+                    updated_at=?
+                WHERE id=?
+            """, (
+                final_review_taken_by or CURRENT_USER,
+                final_review_taken_at or now,
+                now,
+                now,
+                issue_id,
+            ))
+        else:
+            conn.close()
+            return
+
+        conn.commit()
+        conn.close()
+
+        if is_export:
+            self.refresh_export_issue_row(issue_id)
+        else:
+            self.refresh_issue_row(issue_id)
+        self.remember_db_signature()
+
     def take_review_issue(self, issue_id, is_export=False):
         if not self.is_reviewer:
             return
@@ -1336,6 +1779,7 @@ class MainWindow(QMainWindow):
                 review_taken_by=?,
                 review_taken_at=?,
                 review_completed_at=NULL,
+                {FINAL_REVIEW_CLEAR_SQL},
                 updated_at=?
             WHERE id=?
               AND status='done'
@@ -1366,6 +1810,58 @@ class MainWindow(QMainWindow):
             self.refresh_issue_row(issue_id)
         self.remember_db_signature()
 
+    def take_final_review_issue(self, issue_id, is_export=False):
+        if not self.is_final_reviewer:
+            return
+
+        table_name = "export_issues" if is_export else "issues"
+        conn = get_db_connection()
+        cur = conn.cursor()
+        now = datetime.now().isoformat()
+
+        cur.execute(f"""
+            UPDATE {table_name}
+            SET final_review_status='in_progress',
+                final_review_taken_by=?,
+                final_review_taken_at=?,
+                final_review_completed_at=NULL,
+                updated_at=?
+            WHERE id=?
+              AND review_status='done'
+              AND COALESCE(final_review_status, 'free')='free'
+        """, (CURRENT_USER, now, now, issue_id))
+
+        if cur.rowcount == 0:
+            cur.execute(
+                f"SELECT final_review_status, final_review_taken_by FROM {table_name} WHERE id=?",
+                (issue_id,),
+            )
+            row = cur.fetchone()
+            conn.close()
+
+            if row and row[0] == "in_progress" and row[1] and row[1] != CURRENT_USER:
+                QMessageBox.warning(
+                    self,
+                    "Внимание",
+                    f"Запись уже на финальной проверке у пользователя {row[1]}."
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Внимание",
+                    "Эту запись нельзя взять на финальную проверку."
+                )
+            return
+
+        conn.commit()
+        conn.close()
+
+        if is_export:
+            self.refresh_export_issue_row(issue_id)
+        else:
+            self.refresh_issue_row(issue_id)
+        self.remember_db_signature()
+
     def confirm_review_complete(self, issue_id, is_export=False):
         reply = QMessageBox.question(
             self,
@@ -1376,6 +1872,17 @@ class MainWindow(QMainWindow):
         )
         if reply == QMessageBox.Yes:
             self.complete_review_issue(issue_id, is_export=is_export)
+
+    def confirm_final_review_complete(self, issue_id, is_export=False):
+        reply = QMessageBox.question(
+            self,
+            "Подтверждение",
+            "Подтвердить финальную проверку записи?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self.complete_final_review_issue(issue_id, is_export=is_export)
 
     def complete_review_issue(self, issue_id, is_export=False):
         if not self.is_reviewer:
@@ -1402,23 +1909,50 @@ class MainWindow(QMainWindow):
             self.refresh_issue_row(issue_id)
         self.remember_db_signature()
 
-    def add_reviewer(self):
+    def complete_final_review_issue(self, issue_id, is_export=False):
+        if not self.is_final_reviewer:
+            return
+
+        table_name = "export_issues" if is_export else "issues"
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(f"""
+            UPDATE {table_name}
+            SET final_review_status='done',
+                final_review_completed_at=?,
+                updated_at=?
+            WHERE id=?
+              AND final_review_status='in_progress'
+              AND final_review_taken_by=?
+        """, (datetime.now().isoformat(), datetime.now().isoformat(), issue_id, CURRENT_USER))
+        conn.commit()
+        conn.close()
+
+        if is_export:
+            self.refresh_export_issue_row(issue_id)
+        else:
+            self.refresh_issue_row(issue_id)
+        self.remember_db_signature()
+
+    def add_reviewer(self, level=1):
         if not self.is_admin:
             return
 
+        level_label = "1 уровня" if level == 1 else "2 уровня"
         username, ok = QInputDialog.getText(
             self,
-            "Добавить проверяющего",
+            f"Добавить проверяющего {level_label}",
             "Введите Windows-логин пользователя:"
         )
         username = username.strip() if ok else ""
         if not username:
             return
 
+        table_name = "reviewers" if level == 1 else "final_reviewers"
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO reviewers (username, added_by, updated_at)
+        cur.execute(f"""
+            INSERT INTO {table_name} (username, added_by, updated_at)
             VALUES (?, ?, ?)
             ON CONFLICT(username) DO UPDATE SET
                 added_by=excluded.added_by,
@@ -1431,31 +1965,43 @@ class MainWindow(QMainWindow):
         self.load_data()
         if hasattr(self, "export_table"):
             self.load_export_data()
+        if hasattr(self, "journal_progress_table"):
+            self.update_rating()
         self.remember_db_signature()
 
-    def delete_selected_reviewer(self):
-        if not self.is_admin or not getattr(self, "reviewers_list", None):
+    def delete_selected_reviewer(self, level=1):
+        if not self.is_admin:
             return
 
-        selected_items = self.reviewers_list.selectedItems()
+        list_widget = (
+            getattr(self, "reviewers_list", None)
+            if level == 1
+            else getattr(self, "final_reviewers_list", None)
+        )
+        if not list_widget:
+            return
+
+        selected_items = list_widget.selectedItems()
         if not selected_items:
             QMessageBox.warning(self, "Внимание", "Выберите проверяющего для удаления.")
             return
 
         username = selected_items[0].text()
+        level_label = "1 уровня" if level == 1 else "2 уровня"
         reply = QMessageBox.question(
             self,
-            "Удалить проверяющего",
-            f"Удалить пользователя {username} из списка проверяющих?",
+            f"Удалить проверяющего {level_label}",
+            f"Удалить пользователя {username} из списка проверяющих {level_label}?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
         if reply != QMessageBox.Yes:
             return
 
+        table_name = "reviewers" if level == 1 else "final_reviewers"
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("DELETE FROM reviewers WHERE username=?", (username,))
+        cur.execute(f"DELETE FROM {table_name} WHERE username=?", (username,))
         conn.commit()
         conn.close()
 
@@ -1463,6 +2009,8 @@ class MainWindow(QMainWindow):
         self.load_data()
         if hasattr(self, "export_table"):
             self.load_export_data()
+        if hasattr(self, "journal_progress_table"):
+            self.update_rating()
         self.remember_db_signature()
 
     def schedule_load_data(self):
@@ -1562,7 +2110,15 @@ class MainWindow(QMainWindow):
         month_name = MONTH_NAMES_RU.get(dt.month, "Месяц")
         return f"{month_name} {dt.year}"
 
-    def get_month_ranking(self, month_str):
+    def get_rating_mode(self):
+        if getattr(self, "rating_mode_group", None) is None:
+            return "export"
+        checked = self.rating_mode_group.checkedButton()
+        if checked is None:
+            return "export"
+        return checked.property("rating_mode") or "export"
+
+    def get_month_ranking(self, month_str, mode=None):
         if not month_str:
             return []
 
@@ -1571,29 +2127,68 @@ class MainWindow(QMainWindow):
         except ValueError:
             return []
 
+        if mode is None:
+            mode = self.get_rating_mode()
+
+        month_like = month_str + "%"
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("""
-            SELECT taken_by,
-                   COUNT(*) AS cnt,
-                   MIN(completed_at) AS first_done_at
-            FROM (
-                SELECT taken_by, completed_at, id FROM issues
-                WHERE status='done' AND completed_at LIKE ? AND taken_by IS NOT NULL AND TRIM(taken_by) != ''
-                UNION ALL
-                SELECT taken_by, completed_at, id FROM export_issues
-                WHERE status='done' AND completed_at LIKE ? AND taken_by IS NOT NULL AND TRIM(taken_by) != ''
-            )
-            GROUP BY taken_by
-            ORDER BY cnt DESC, first_done_at ASC
-        """, (month_str + "%", month_str + "%"))
+
+        if mode == "review":
+            cur.execute("""
+                SELECT review_taken_by,
+                       COUNT(*) AS cnt,
+                       MIN(review_completed_at) AS first_done_at
+                FROM (
+                    SELECT review_taken_by, review_completed_at, id FROM issues
+                    WHERE review_status='done'
+                      AND review_completed_at LIKE ?
+                      AND review_taken_by IS NOT NULL
+                      AND TRIM(review_taken_by) != ''
+                    UNION ALL
+                    SELECT review_taken_by, review_completed_at, id FROM export_issues
+                    WHERE review_status='done'
+                      AND review_completed_at LIKE ?
+                      AND review_taken_by IS NOT NULL
+                      AND TRIM(review_taken_by) != ''
+                )
+                GROUP BY review_taken_by
+                ORDER BY cnt DESC, first_done_at ASC
+            """, (month_like, month_like))
+        else:
+            cur.execute("""
+                SELECT taken_by,
+                       COUNT(*) AS cnt,
+                       MIN(completed_at) AS first_done_at
+                FROM (
+                    SELECT taken_by, completed_at, id FROM issues
+                    WHERE status='done'
+                      AND completed_at LIKE ?
+                      AND taken_by IS NOT NULL
+                      AND TRIM(taken_by) != ''
+                    UNION ALL
+                    SELECT taken_by, completed_at, id FROM export_issues
+                    WHERE status='done'
+                      AND completed_at LIKE ?
+                      AND taken_by IS NOT NULL
+                      AND TRIM(taken_by) != ''
+                )
+                GROUP BY taken_by
+                ORDER BY cnt DESC, first_done_at ASC
+            """, (month_like, month_like))
+
         rows = cur.fetchall()
         conn.close()
 
-        return [(taken_by, cnt) for taken_by, cnt, _ in rows]
+        return [(username, cnt) for username, cnt, _ in rows]
 
-    def format_month_ranking_text(self, ranking_rows):
+    def format_month_ranking_text(self, ranking_rows, mode=None):
+        if mode is None:
+            mode = self.get_rating_mode()
+
         if not ranking_rows:
+            if mode == "review":
+                return "Нет проверенных журналов"
             return "Нет завершенных журналов"
 
         def format_place(place: int) -> str:
@@ -1699,15 +2294,21 @@ class MainWindow(QMainWindow):
 
         issue_changes = [row_id for _, table_name, row_id, _ in changes if table_name == "issues"]
         export_changes = [row_id for _, table_name, row_id, _ in changes if table_name == "export_issues"]
-        reviewers_changed = any(table_name == "reviewers" for _, table_name, _, _ in changes)
+        reviewers_changed = any(
+            table_name in {"reviewers", "final_reviewers"}
+            for _, table_name, _, _ in changes
+        )
         rating_changed = any(
-            table_name in {"issues", "monthly_plans", "rating_months"}
+            table_name in {"issues", "export_issues", "monthly_plans", "rating_months"}
             for _, table_name, _, _ in changes
         )
 
         if reviewers_changed:
             self.is_reviewer = self.user_is_reviewer(CURRENT_USER)
-            if self.is_admin and hasattr(self, "reviewers_list"):
+            self.is_final_reviewer = self.user_is_final_reviewer(CURRENT_USER)
+            if self.is_admin and (
+                hasattr(self, "reviewers_list") or hasattr(self, "final_reviewers_list")
+            ):
                 self.refresh_reviewers_list()
 
         if current_tab == self.main_tab:
@@ -1916,7 +2517,9 @@ class MainWindow(QMainWindow):
         cur = conn.cursor()
         cur.execute("""
             SELECT id, journal, year, issue, path, status, taken_by, taken_at, completed_at,
-                   review_status, review_taken_by, review_taken_at, review_completed_at
+                   review_status, review_taken_by, review_taken_at, review_completed_at,
+                   final_review_status, final_review_taken_by, final_review_taken_at,
+                   final_review_completed_at
             FROM issues
             WHERE id=?
         """, (issue_id,))
@@ -1944,12 +2547,21 @@ class MainWindow(QMainWindow):
         review_status=None,
         review_taken_by=None,
         review_taken_at=None,
-        review_completed_at=None
+        review_completed_at=None,
+        final_review_status=None,
+        final_review_taken_by=None,
+        final_review_taken_at=None,
+        final_review_completed_at=None,
     ):
         filter_value = self.filter_box.currentText()
         review_filter_value = (
             self.review_filter_box.currentText()
             if hasattr(self, "review_filter_box")
+            else "Все"
+        )
+        final_review_filter_value = (
+            self.final_review_filter_box.currentText()
+            if hasattr(self, "final_review_filter_box")
             else "Все"
         )
         journal_filter = self.journal_filter_box.currentText()
@@ -1979,6 +2591,24 @@ class MainWindow(QMainWindow):
         if review_filter_value == "Мои" and (status != "done" or review_taken_by != CURRENT_USER):
             return False
 
+        normalized_final_review_status = final_review_status or "free"
+        if final_review_filter_value == "Свободные" and (
+            normalized_review_status != "done" or normalized_final_review_status != "free"
+        ):
+            return False
+        if final_review_filter_value == "В работе" and (
+            normalized_review_status != "done" or normalized_final_review_status != "in_progress"
+        ):
+            return False
+        if final_review_filter_value == "Готово" and (
+            normalized_review_status != "done" or normalized_final_review_status != "done"
+        ):
+            return False
+        if final_review_filter_value == "Мои" and (
+            normalized_review_status != "done" or final_review_taken_by != CURRENT_USER
+        ):
+            return False
+
         if journal_filter != "Все журналы" and (journal or "").strip().casefold() != journal_filter.strip().casefold():
             return False
 
@@ -1995,6 +2625,8 @@ class MainWindow(QMainWindow):
             taken_by=taken_by,
             review_status=review_status,
             review_taken_by=review_taken_by,
+            final_review_status=final_review_status,
+            final_review_taken_by=final_review_taken_by,
         )
 
     def check_issue_integrity(self):
@@ -2158,6 +2790,10 @@ class MainWindow(QMainWindow):
             review_taken_by,
             review_taken_at,
             review_completed_at,
+            final_review_status,
+            final_review_taken_by,
+            final_review_taken_at,
+            final_review_completed_at,
         ) = row_data
 
         row = self.find_issue_row(issue_id)
@@ -2175,7 +2811,11 @@ class MainWindow(QMainWindow):
             review_status,
             review_taken_by,
             review_taken_at,
-            review_completed_at
+            review_completed_at,
+            final_review_status,
+            final_review_taken_by,
+            final_review_taken_at,
+            final_review_completed_at,
         ):
             if row >= 0:
                 self.table.removeRow(row)
@@ -2271,6 +2911,14 @@ class MainWindow(QMainWindow):
                 self.get_review_action_button(id_, status, review_status, review_taken_by)
             )
             self.set_review_status_cell(self.table, row, id_, status, review_status)
+            self.set_final_review_cells(
+                self.table,
+                row,
+                id_,
+                review_status,
+                final_review_status,
+                final_review_taken_by,
+            )
             self.set_completed_at_cell(self.table, row, id_, completed_at, status)
         finally:
             self.table.blockSignals(False)
@@ -2306,6 +2954,10 @@ class MainWindow(QMainWindow):
             self.review_filter_box = QComboBox()
             self.review_filter_box.addItems(["Все", "Свободные", "В работе", "Мои", "Готово"])
 
+        if self.is_admin or self.is_final_reviewer:
+            self.final_review_filter_box = QComboBox()
+            self.final_review_filter_box.addItems(["Все", "Свободные", "В работе", "Мои", "Готово"])
+
         if self.is_admin:
             refresh_btn = QPushButton("🔄 Обновить")
             refresh_btn.clicked.connect(self.load_data)
@@ -2330,6 +2982,9 @@ class MainWindow(QMainWindow):
         if self.is_admin or self.is_reviewer:
             filter_layout.addWidget(QLabel("Статус проверки:"))
             filter_layout.addWidget(self.review_filter_box)
+        if self.is_admin or self.is_final_reviewer:
+            filter_layout.addWidget(QLabel("Статус фин. проверки:"))
+            filter_layout.addWidget(self.final_review_filter_box)
         filter_layout.addStretch()
 
         if self.is_admin:
@@ -2352,13 +3007,8 @@ class MainWindow(QMainWindow):
         table_frame_layout = QVBoxLayout(self.table_frame)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(10)
-        self.table.setHorizontalHeaderLabels(
-            [
-                "Журнал", "Год", "Выпуск", "Статус", "Кто", "Действие",
-                "Кто проверил", "Проверка", "Статус проверки", "Дата готовности",
-            ]
-        )
+        self.table.setColumnCount(len(ISSUES_TABLE_HEADERS))
+        self.table.setHorizontalHeaderLabels(ISSUES_TABLE_HEADERS)
         self.table.setColumnHidden(ISSUES_TABLE_COLUMN_COMPLETED_AT, not self.is_admin)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -2413,6 +3063,8 @@ class MainWindow(QMainWindow):
         self.filter_box.currentTextChanged.connect(self.schedule_load_data)
         if self.is_admin or self.is_reviewer:
             self.review_filter_box.currentTextChanged.connect(self.schedule_load_data)
+        if self.is_admin or self.is_final_reviewer:
+            self.final_review_filter_box.currentTextChanged.connect(self.schedule_load_data)
         self.load_journal_filter_options()
 
         layout.addWidget(self.filter_frame)
@@ -2474,6 +3126,12 @@ class MainWindow(QMainWindow):
             self.export_review_filter_box = QComboBox()
             self.export_review_filter_box.addItems(["Все", "Свободные", "В работе", "Мои", "Готово"])
 
+        if self.is_admin or self.is_final_reviewer:
+            self.export_final_review_filter_box = QComboBox()
+            self.export_final_review_filter_box.addItems(
+                ["Все", "Свободные", "В работе", "Мои", "Готово"]
+            )
+
         filter_layout.addWidget(QLabel("Поиск:"))
         filter_layout.addWidget(self.export_search_box)
         filter_layout.addWidget(QLabel("Журнал:"))
@@ -2485,6 +3143,9 @@ class MainWindow(QMainWindow):
         if self.is_admin or self.is_reviewer:
             filter_layout.addWidget(QLabel("Статус проверки:"))
             filter_layout.addWidget(self.export_review_filter_box)
+        if self.is_admin or self.is_final_reviewer:
+            filter_layout.addWidget(QLabel("Статус фин. проверки:"))
+            filter_layout.addWidget(self.export_final_review_filter_box)
         filter_layout.addStretch()
 
         export_excel_btn = QPushButton("📊 Экспорт в Excel")
@@ -2574,13 +3235,8 @@ class MainWindow(QMainWindow):
         table_frame_layout = QVBoxLayout(self.export_table_frame)
 
         self.export_table = QTableWidget()
-        self.export_table.setColumnCount(10)
-        self.export_table.setHorizontalHeaderLabels(
-            [
-                "Журнал", "Год", "Выпуск", "Статус", "Кто", "Действие",
-                "Кто проверил", "Проверка", "Статус проверки", "Дата готовности",
-            ]
-        )
+        self.export_table.setColumnCount(len(ISSUES_TABLE_HEADERS))
+        self.export_table.setHorizontalHeaderLabels(ISSUES_TABLE_HEADERS)
         self.export_table.setColumnHidden(ISSUES_TABLE_COLUMN_COMPLETED_AT, not self.is_admin)
         self.export_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.export_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -2633,6 +3289,10 @@ class MainWindow(QMainWindow):
         self.export_filter_box.currentTextChanged.connect(self.schedule_export_load_data)
         if self.is_admin or self.is_reviewer:
             self.export_review_filter_box.currentTextChanged.connect(self.schedule_export_load_data)
+        if self.is_admin or self.is_final_reviewer:
+            self.export_final_review_filter_box.currentTextChanged.connect(
+                self.schedule_export_load_data
+            )
 
         self.load_export_journal_filter_options()
 
@@ -2678,7 +3338,7 @@ class MainWindow(QMainWindow):
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Проверяющие")
-        dialog.resize(420, 420)
+        dialog.resize(460, 460)
 
         layout = QVBoxLayout()
 
@@ -2690,27 +3350,47 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-weight: 700; font-size: 14px; color: #1f2937;")
 
         hint = QLabel(
-            "Добавляйте Windows-логины сотрудников, которым доступна кнопка проверки."
+            "1 уровень — проверка журналов. "
+            "2 уровень — финальная проверка (проверка проверяющих)."
         )
         hint.setWordWrap(True)
 
+        tabs = QTabWidget()
+
+        level1_tab = QWidget()
+        level1_layout = QVBoxLayout(level1_tab)
         self.reviewers_list = QListWidget()
+        level1_buttons = QHBoxLayout()
+        add_l1_btn = QPushButton("Добавить проверяющего")
+        add_l1_btn.clicked.connect(lambda: self.add_reviewer(level=1))
+        delete_l1_btn = QPushButton("Удалить выбранного")
+        delete_l1_btn.clicked.connect(lambda: self.delete_selected_reviewer(level=1))
+        level1_buttons.addWidget(add_l1_btn)
+        level1_buttons.addWidget(delete_l1_btn)
+        level1_buttons.addStretch()
+        level1_layout.addWidget(self.reviewers_list)
+        level1_layout.addLayout(level1_buttons)
 
-        buttons_layout = QHBoxLayout()
-        add_btn = QPushButton("Добавить проверяющего")
-        add_btn.clicked.connect(self.add_reviewer)
+        level2_tab = QWidget()
+        level2_layout = QVBoxLayout(level2_tab)
+        self.final_reviewers_list = QListWidget()
+        level2_buttons = QHBoxLayout()
+        add_l2_btn = QPushButton("Добавить проверяющего")
+        add_l2_btn.clicked.connect(lambda: self.add_reviewer(level=2))
+        delete_l2_btn = QPushButton("Удалить выбранного")
+        delete_l2_btn.clicked.connect(lambda: self.delete_selected_reviewer(level=2))
+        level2_buttons.addWidget(add_l2_btn)
+        level2_buttons.addWidget(delete_l2_btn)
+        level2_buttons.addStretch()
+        level2_layout.addWidget(self.final_reviewers_list)
+        level2_layout.addLayout(level2_buttons)
 
-        delete_btn = QPushButton("Удалить выбранного")
-        delete_btn.clicked.connect(self.delete_selected_reviewer)
-
-        buttons_layout.addWidget(add_btn)
-        buttons_layout.addWidget(delete_btn)
-        buttons_layout.addStretch()
+        tabs.addTab(level1_tab, "Проверяющие 1 ур.")
+        tabs.addTab(level2_tab, "Проверяющие 2 ур.")
 
         frame_layout.addWidget(title)
         frame_layout.addWidget(hint)
-        frame_layout.addWidget(self.reviewers_list)
-        frame_layout.addLayout(buttons_layout)
+        frame_layout.addWidget(tabs)
 
         layout.addWidget(frame)
         dialog.setLayout(layout)
@@ -2733,6 +3413,7 @@ class MainWindow(QMainWindow):
         self.refresh_reviewers_list()
         dialog.exec()
         self.reviewers_list = None
+        self.final_reviewers_list = None
 
     def load_export_journal_filter_options(self):
         current = self.export_journal_filter_box.currentText() if hasattr(self, "export_journal_filter_box") else "Все журналы"
@@ -2852,12 +3533,21 @@ class MainWindow(QMainWindow):
         review_status=None,
         review_taken_by=None,
         review_taken_at=None,
-        review_completed_at=None
+        review_completed_at=None,
+        final_review_status=None,
+        final_review_taken_by=None,
+        final_review_taken_at=None,
+        final_review_completed_at=None,
     ):
         filter_value = self.export_filter_box.currentText()
         review_filter_value = (
             self.export_review_filter_box.currentText()
             if hasattr(self, "export_review_filter_box")
+            else "Все"
+        )
+        final_review_filter_value = (
+            self.export_final_review_filter_box.currentText()
+            if hasattr(self, "export_final_review_filter_box")
             else "Все"
         )
         journal_filter = self.export_journal_filter_box.currentText()
@@ -2887,6 +3577,24 @@ class MainWindow(QMainWindow):
         if review_filter_value == "Мои" and (status != "done" or review_taken_by != CURRENT_USER):
             return False
 
+        normalized_final_review_status = final_review_status or "free"
+        if final_review_filter_value == "Свободные" and (
+            normalized_review_status != "done" or normalized_final_review_status != "free"
+        ):
+            return False
+        if final_review_filter_value == "В работе" and (
+            normalized_review_status != "done" or normalized_final_review_status != "in_progress"
+        ):
+            return False
+        if final_review_filter_value == "Готово" and (
+            normalized_review_status != "done" or normalized_final_review_status != "done"
+        ):
+            return False
+        if final_review_filter_value == "Мои" and (
+            normalized_review_status != "done" or final_review_taken_by != CURRENT_USER
+        ):
+            return False
+
         if journal_filter != "Все журналы" and (journal or "").strip().casefold() != journal_filter.strip().casefold():
             return False
 
@@ -2902,6 +3610,8 @@ class MainWindow(QMainWindow):
             taken_by=taken_by,
             review_status=review_status,
             review_taken_by=review_taken_by,
+            final_review_status=final_review_status,
+            final_review_taken_by=final_review_taken_by,
         )
 
     def get_export_issue_row_data(self, issue_id):
@@ -2909,7 +3619,9 @@ class MainWindow(QMainWindow):
         cur = conn.cursor()
         cur.execute("""
             SELECT id, journal, year, issue, status, taken_by, taken_at, completed_at,
-                   review_status, review_taken_by, review_taken_at, review_completed_at
+                   review_status, review_taken_by, review_taken_at, review_completed_at,
+                   final_review_status, final_review_taken_by, final_review_taken_at,
+                   final_review_completed_at
             FROM export_issues
             WHERE id=?
         """, (issue_id,))
@@ -2938,6 +3650,10 @@ class MainWindow(QMainWindow):
             review_taken_by,
             review_taken_at,
             review_completed_at,
+            final_review_status,
+            final_review_taken_by,
+            final_review_taken_at,
+            final_review_completed_at,
         ) = row_data
 
         row = self.find_export_issue_row(issue_id)
@@ -2953,7 +3669,11 @@ class MainWindow(QMainWindow):
             review_status,
             review_taken_by,
             review_taken_at,
-            review_completed_at
+            review_completed_at,
+            final_review_status,
+            final_review_taken_by,
+            final_review_taken_at,
+            final_review_completed_at,
         ):
             if row >= 0:
                 self.export_table.removeRow(row)
@@ -3046,6 +3766,15 @@ class MainWindow(QMainWindow):
                 self.get_review_action_button(id_, status, review_status, review_taken_by, is_export=True)
             )
             self.set_review_status_cell(self.export_table, row, id_, status, review_status, is_export=True)
+            self.set_final_review_cells(
+                self.export_table,
+                row,
+                id_,
+                review_status,
+                final_review_status,
+                final_review_taken_by,
+                is_export=True,
+            )
             self.set_completed_at_cell(self.export_table, row, id_, completed_at, status)
         finally:
             self.export_table.blockSignals(False)
@@ -3066,13 +3795,20 @@ class MainWindow(QMainWindow):
             if hasattr(self, "export_review_filter_box")
             else "Все"
         )
+        final_review_filter_value = (
+            self.export_final_review_filter_box.currentText()
+            if hasattr(self, "export_final_review_filter_box")
+            else "Все"
+        )
         journal_filter = self.export_journal_filter_box.currentText()
         search_text = self.export_search_box.text().strip().casefold()
         completed_at_filter_date = parse_date_filter_input(self.export_completed_at_filter_box.text())
 
         query = """
             SELECT id, journal, year, issue, status, taken_by, taken_at, completed_at,
-                   review_status, review_taken_by, review_taken_at, review_completed_at
+                   review_status, review_taken_by, review_taken_at, review_completed_at,
+                   final_review_status, final_review_taken_by, final_review_taken_at,
+                   final_review_completed_at
             FROM export_issues
             WHERE 1=1
         """
@@ -3096,6 +3832,19 @@ class MainWindow(QMainWindow):
             query += " AND status = 'done' AND review_status = 'done'"
         elif review_filter_value == "Мои":
             query += " AND status = 'done' AND review_taken_by = ?"
+            params.append(CURRENT_USER)
+
+        if final_review_filter_value == "Свободные":
+            query += (
+                " AND review_status = 'done'"
+                " AND COALESCE(final_review_status, 'free') = 'free'"
+            )
+        elif final_review_filter_value == "В работе":
+            query += " AND review_status = 'done' AND final_review_status = 'in_progress'"
+        elif final_review_filter_value == "Готово":
+            query += " AND review_status = 'done' AND final_review_status = 'done'"
+        elif final_review_filter_value == "Мои":
+            query += " AND review_status = 'done' AND final_review_taken_by = ?"
             params.append(CURRENT_USER)
 
         if journal_filter != "Все журналы":
@@ -3138,6 +3887,10 @@ class MainWindow(QMainWindow):
                 review_taken_by,
                 review_taken_at,
                 review_completed_at,
+                final_review_status,
+                final_review_taken_by,
+                final_review_taken_at,
+                final_review_completed_at,
             ) = row_data
 
             self.export_table.insertRow(row_idx)
@@ -3204,6 +3957,15 @@ class MainWindow(QMainWindow):
                 self.get_review_action_button(id_, status, review_status, review_taken_by, is_export=True)
             )
             self.set_review_status_cell(self.export_table, row_idx, id_, status, review_status, is_export=True)
+            self.set_final_review_cells(
+                self.export_table,
+                row_idx,
+                id_,
+                review_status,
+                final_review_status,
+                final_review_taken_by,
+                is_export=True,
+            )
             self.set_completed_at_cell(self.export_table, row_idx, id_, completed_at, status)
 
         self.export_table.blockSignals(False)
@@ -3373,6 +4135,10 @@ class MainWindow(QMainWindow):
                     review_taken_by=NULL,
                     review_taken_at=NULL,
                     review_completed_at=NULL,
+                    final_review_status='free',
+                    final_review_taken_by=NULL,
+                    final_review_taken_at=NULL,
+                    final_review_completed_at=NULL,
                     updated_at=?
                 WHERE id=?
             """, (datetime.now().isoformat(), issue_id))
@@ -3393,6 +4159,10 @@ class MainWindow(QMainWindow):
                     review_taken_by=NULL,
                     review_taken_at=NULL,
                     review_completed_at=NULL,
+                    final_review_status='free',
+                    final_review_taken_by=NULL,
+                    final_review_taken_at=NULL,
+                    final_review_completed_at=NULL,
                     updated_at=?
                 WHERE id=?
             """, (taken_by, taken_at, datetime.now().isoformat(), issue_id))
@@ -3546,6 +4316,33 @@ class MainWindow(QMainWindow):
                 column_map[column] = "review_taken_at"
             elif key in {"reviewcompletedat", "датапроверки", "проверено"}:
                 column_map[column] = "review_completed_at"
+            elif key in {
+                "finalreviewstatus",
+                "статусфинпроверки",
+                "статусфинальнойпроверки",
+                "финпроверка",
+            }:
+                column_map[column] = "final_review_status"
+            elif key in {
+                "finalreviewtakenby",
+                "ктофинальнопроверил",
+                "финпроверяющий",
+                "финальныйпроверяющий",
+            }:
+                column_map[column] = "final_review_taken_by"
+            elif key in {
+                "finalreviewtakenat",
+                "датавзятиянафинпроверку",
+                "датавзятиянафинальнуюпроверку",
+            }:
+                column_map[column] = "final_review_taken_at"
+            elif key in {
+                "finalreviewcompletedat",
+                "датафинпроверки",
+                "датафинальнойпроверки",
+                "финальнопроверено",
+            }:
+                column_map[column] = "final_review_completed_at"
 
         df = df.rename(columns=column_map)
 
@@ -3621,12 +4418,22 @@ class MainWindow(QMainWindow):
             review_taken_by = cell_to_text(row.get("review_taken_by", ""))
             review_taken_at = cell_to_text(row.get("review_taken_at", ""))
             review_completed_at = cell_to_text(row.get("review_completed_at", ""))
+            final_review_status = normalize_review_status(
+                row.get("final_review_status", "free")
+            )
+            final_review_taken_by = cell_to_text(row.get("final_review_taken_by", ""))
+            final_review_taken_at = cell_to_text(row.get("final_review_taken_at", ""))
+            final_review_completed_at = cell_to_text(
+                row.get("final_review_completed_at", "")
+            )
 
             cur.execute("""
                 INSERT OR IGNORE INTO export_issues
                     (journal, year, issue, status, taken_by, taken_at, completed_at,
-                     review_status, review_taken_by, review_taken_at, review_completed_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     review_status, review_taken_by, review_taken_at, review_completed_at,
+                     final_review_status, final_review_taken_by, final_review_taken_at,
+                     final_review_completed_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 journal,
                 year,
@@ -3639,6 +4446,10 @@ class MainWindow(QMainWindow):
                 review_taken_by or None,
                 review_taken_at or None,
                 review_completed_at or None,
+                final_review_status,
+                final_review_taken_by or None,
+                final_review_taken_at or None,
+                final_review_completed_at or None,
                 datetime.now().isoformat()
             ))
 
@@ -3668,13 +4479,20 @@ class MainWindow(QMainWindow):
             if hasattr(self, "review_filter_box")
             else "Все"
         )
+        final_review_filter_value = (
+            self.final_review_filter_box.currentText()
+            if hasattr(self, "final_review_filter_box")
+            else "Все"
+        )
         journal_filter = self.journal_filter_box.currentText()
         search_text = self.search_box.text().strip().casefold()
         completed_at_filter_date = parse_date_filter_input(self.completed_at_filter_box.text())
 
         query = """
             SELECT id, journal, year, issue, path, status, taken_by, taken_at, completed_at,
-                   review_status, review_taken_by, review_taken_at, review_completed_at
+                   review_status, review_taken_by, review_taken_at, review_completed_at,
+                   final_review_status, final_review_taken_by, final_review_taken_at,
+                   final_review_completed_at
             FROM issues
             WHERE 1=1
         """
@@ -3698,6 +4516,19 @@ class MainWindow(QMainWindow):
             query += " AND status = 'done' AND review_status = 'done'"
         elif review_filter_value == "Мои":
             query += " AND status = 'done' AND review_taken_by = ?"
+            params.append(CURRENT_USER)
+
+        if final_review_filter_value == "Свободные":
+            query += (
+                " AND review_status = 'done'"
+                " AND COALESCE(final_review_status, 'free') = 'free'"
+            )
+        elif final_review_filter_value == "В работе":
+            query += " AND review_status = 'done' AND final_review_status = 'in_progress'"
+        elif final_review_filter_value == "Готово":
+            query += " AND review_status = 'done' AND final_review_status = 'done'"
+        elif final_review_filter_value == "Мои":
+            query += " AND review_status = 'done' AND final_review_taken_by = ?"
             params.append(CURRENT_USER)
 
         if journal_filter != "Все журналы":
@@ -3742,6 +4573,10 @@ class MainWindow(QMainWindow):
                 review_taken_by,
                 review_taken_at,
                 review_completed_at,
+                final_review_status,
+                final_review_taken_by,
+                final_review_taken_at,
+                final_review_completed_at,
             ) = row_data
 
             self.table.insertRow(row_idx)
@@ -3810,6 +4645,14 @@ class MainWindow(QMainWindow):
                 self.get_review_action_button(id_, status, review_status, review_taken_by)
             )
             self.set_review_status_cell(self.table, row_idx, id_, status, review_status)
+            self.set_final_review_cells(
+                self.table,
+                row_idx,
+                id_,
+                review_status,
+                final_review_status,
+                final_review_taken_by,
+            )
             self.set_completed_at_cell(self.table, row_idx, id_, completed_at, status)
 
         self.table.blockSignals(False)
@@ -3879,6 +4722,10 @@ class MainWindow(QMainWindow):
                     review_taken_by=NULL,
                     review_taken_at=NULL,
                     review_completed_at=NULL,
+                    final_review_status='free',
+                    final_review_taken_by=NULL,
+                    final_review_taken_at=NULL,
+                    final_review_completed_at=NULL,
                     updated_at=?
                 WHERE id=?
             """, (datetime.now().isoformat(), issue_id))
@@ -3899,6 +4746,10 @@ class MainWindow(QMainWindow):
                     review_taken_by=NULL,
                     review_taken_at=NULL,
                     review_completed_at=NULL,
+                    final_review_status='free',
+                    final_review_taken_by=NULL,
+                    final_review_taken_at=NULL,
+                    final_review_completed_at=NULL,
                     updated_at=?
                 WHERE id=?
             """, (taken_by, taken_at, datetime.now().isoformat(), issue_id))
@@ -4037,6 +4888,10 @@ class MainWindow(QMainWindow):
         df["review_status"] = df["review_status"].map(
             lambda value: self.get_review_status_text(value, "done")
         )
+        if "final_review_status" in df.columns:
+            df["final_review_status"] = df["final_review_status"].map(
+                lambda value: self.get_final_review_status_text(value, "done")
+            )
         df["completed_at"] = df["completed_at"].map(format_report_datetime)
 
         df = df.rename(columns={column: title for column, title in ISSUES_REPORT_COLUMNS})
@@ -4051,6 +4906,11 @@ class MainWindow(QMainWindow):
         review_filter_value = (
             self.export_review_filter_box.currentText()
             if hasattr(self, "export_review_filter_box")
+            else "Все"
+        )
+        final_review_filter_value = (
+            self.export_final_review_filter_box.currentText()
+            if hasattr(self, "export_final_review_filter_box")
             else "Все"
         )
         journal_filter = self.export_journal_filter_box.currentText()
@@ -4085,6 +4945,19 @@ class MainWindow(QMainWindow):
             query += " AND status = 'done' AND review_taken_by = ?"
             params.append(CURRENT_USER)
 
+        if final_review_filter_value == "Свободные":
+            query += (
+                " AND review_status = 'done'"
+                " AND COALESCE(final_review_status, 'free') = 'free'"
+            )
+        elif final_review_filter_value == "В работе":
+            query += " AND review_status = 'done' AND final_review_status = 'in_progress'"
+        elif final_review_filter_value == "Готово":
+            query += " AND review_status = 'done' AND final_review_status = 'done'"
+        elif final_review_filter_value == "Мои":
+            query += " AND review_status = 'done' AND final_review_taken_by = ?"
+            params.append(CURRENT_USER)
+
         if journal_filter != "Все журналы":
             query += " AND journal = ?"
             params.append(journal_filter)
@@ -4108,6 +4981,8 @@ class MainWindow(QMainWindow):
                     taken_by=row.get("taken_by"),
                     review_status=row.get("review_status"),
                     review_taken_by=row.get("review_taken_by"),
+                    final_review_status=row.get("final_review_status"),
+                    final_review_taken_by=row.get("final_review_taken_by"),
                 ),
                 axis=1,
             )
@@ -4125,6 +5000,10 @@ class MainWindow(QMainWindow):
         df["review_status"] = df["review_status"].map(
             lambda value: self.get_review_status_text(value, "done")
         )
+        if "final_review_status" in df.columns:
+            df["final_review_status"] = df["final_review_status"].map(
+                lambda value: self.get_final_review_status_text(value, "done")
+            )
         df["completed_at"] = df["completed_at"].map(format_report_datetime)
 
         df = df.rename(columns={column: title for column, title in ISSUES_REPORT_COLUMNS})
@@ -4300,16 +5179,12 @@ class MainWindow(QMainWindow):
         self.journal_progress_summary_label = QLabel()
         self.journal_progress_summary_label.setWordWrap(False)
         self.journal_progress_summary_label.setStyleSheet("font-size: 14px; color: #1f2937;")
-        self.journal_progress_table.setColumnCount(7)
-        self.journal_progress_table.setHorizontalHeaderLabels([
-            "Журнал",
-            "Всего, шт",
-            "Выгружено, шт",
-            "Выгружено, %",
-            "На проверку, шт",
-            "Проверено, шт",
-            "Проверено, %",
-        ])
+        show_final_stats = self.can_see_final_review_stats()
+        headers = list(RATING_PROGRESS_BASE_HEADERS)
+        if show_final_stats:
+            headers.extend(RATING_PROGRESS_FINAL_HEADERS)
+        self.journal_progress_table.setColumnCount(len(headers))
+        self.journal_progress_table.setHorizontalHeaderLabels(headers)
         self.journal_progress_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.journal_progress_table.setAlternatingRowColors(True)
         self.journal_progress_table.verticalHeader().setDefaultSectionSize(28)
@@ -4337,7 +5212,7 @@ class MainWindow(QMainWindow):
         """)
         apply_static_column_widths(
             self.journal_progress_table,
-            RATING_PROGRESS_COLUMN_SAMPLES,
+            RATING_PROGRESS_COLUMN_SAMPLES[:len(headers)],
         )
 
         journal_layout.addWidget(journal_title)
@@ -4355,6 +5230,19 @@ class MainWindow(QMainWindow):
         board_title.setStyleSheet("font-weight: 700; font-size: 14px; color: #1f2937;")
         board_header.addWidget(board_title)
         board_header.addStretch()
+
+        self.rating_mode_group = QButtonGroup(self.rating_board_frame)
+        self.rating_mode_export_radio = QRadioButton("Выгрузка")
+        self.rating_mode_export_radio.setProperty("rating_mode", "export")
+        self.rating_mode_export_radio.setChecked(True)
+        self.rating_mode_review_radio = QRadioButton("Проверка")
+        self.rating_mode_review_radio.setProperty("rating_mode", "review")
+        self.rating_mode_group.addButton(self.rating_mode_export_radio)
+        self.rating_mode_group.addButton(self.rating_mode_review_radio)
+        self.rating_mode_group.buttonClicked.connect(lambda _button: self.update_rating())
+
+        board_header.addWidget(self.rating_mode_export_radio)
+        board_header.addWidget(self.rating_mode_review_radio)
 
         if self.is_admin:
             save_months_btn = QPushButton("Сохранить месяцы")
@@ -4460,6 +5348,11 @@ class MainWindow(QMainWindow):
                 border: none;
                 border-radius: 6px;
             }
+            QRadioButton {
+                spacing: 6px;
+                color: #1f2937;
+                font-size: 13px;
+            }
         """)
 
         if self.is_admin:
@@ -4467,6 +5360,7 @@ class MainWindow(QMainWindow):
 
     def update_rating(self):
         self.is_reviewer = self.user_is_reviewer(CURRENT_USER)
+        self.is_final_reviewer = self.user_is_final_reviewer(CURRENT_USER)
 
         conn = get_db_connection()
         cur = conn.cursor()
@@ -4516,16 +5410,33 @@ class MainWindow(QMainWindow):
         to_review_all = max(done_all - reviewed_all, 0)
         reviewed_percent = int((reviewed_all / done_all) * 100) if done_all else 0
 
+        show_final_stats = self.can_see_final_review_stats()
+        final_reviewed_all = 0
+        to_final_review_all = 0
+        final_reviewed_percent = 0
+
+        if show_final_stats:
+            cur.execute("SELECT COUNT(*) FROM issues WHERE final_review_status='done'")
+            final_reviewed_issues = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM export_issues WHERE final_review_status='done'")
+            final_reviewed_export = cur.fetchone()[0]
+            final_reviewed_all = final_reviewed_issues + final_reviewed_export
+            to_final_review_all = max(reviewed_all - final_reviewed_all, 0)
+            final_reviewed_percent = (
+                int((final_reviewed_all / reviewed_all) * 100) if reviewed_all else 0
+            )
+
         # Статистика по журналам: объединяем обе таблицы
         cur.execute("""
             SELECT journal,
                    COUNT(*) AS total_count,
                    SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS done_count,
-                   SUM(CASE WHEN review_status='done' THEN 1 ELSE 0 END) AS reviewed_count
+                   SUM(CASE WHEN review_status='done' THEN 1 ELSE 0 END) AS reviewed_count,
+                   SUM(CASE WHEN final_review_status='done' THEN 1 ELSE 0 END) AS final_reviewed_count
             FROM (
-                SELECT journal, status, review_status FROM issues
+                SELECT journal, status, review_status, final_review_status FROM issues
                 UNION ALL
-                SELECT journal, status, review_status FROM export_issues
+                SELECT journal, status, review_status, final_review_status FROM export_issues
             )
             GROUP BY journal
             ORDER BY journal COLLATE NOCASE
@@ -4557,20 +5468,40 @@ class MainWindow(QMainWindow):
             f"Общий прогресс: {overall_percent}%"
         )
 
-        self.journal_progress_summary_label.setText(
+        summary_text = (
             f"Всего: {total_all} | Выгружено: {done_all} ({overall_percent}%) | "
             f"На проверку: {to_review_all} | Проверено: {reviewed_all} ({reviewed_percent}%)"
         )
+        if show_final_stats:
+            summary_text += (
+                f" | На фин. проверку: {to_final_review_all} | "
+                f"Фин. проверка: {final_reviewed_all} ({final_reviewed_percent}%)"
+            )
+        self.journal_progress_summary_label.setText(summary_text)
+
+        headers = list(RATING_PROGRESS_BASE_HEADERS)
+        if show_final_stats:
+            headers.extend(RATING_PROGRESS_FINAL_HEADERS)
+        if self.journal_progress_table.columnCount() != len(headers):
+            self.journal_progress_table.setColumnCount(len(headers))
+            self.journal_progress_table.setHorizontalHeaderLabels(headers)
+            apply_static_column_widths(
+                self.journal_progress_table,
+                RATING_PROGRESS_COLUMN_SAMPLES[:len(headers)],
+            )
 
         self.journal_progress_table.setRowCount(0)
         self.journal_progress_table.setUpdatesEnabled(False)
         self.journal_progress_table.blockSignals(True)
 
-        for journal, total_count, done_count, reviewed_count in journal_rows:
+        for journal, total_count, done_count, reviewed_count, final_reviewed_count in journal_rows:
             journal_name = journal or "Без названия"
             exported_percent = int((done_count / total_count) * 100) if total_count else 0
             to_review_count = max(done_count - reviewed_count, 0)
             reviewed_percent_value = int((reviewed_count / done_count) * 100) if done_count else 0
+            final_reviewed_percent_value = (
+                int((final_reviewed_count / reviewed_count) * 100) if reviewed_count else 0
+            )
 
             row = self.journal_progress_table.rowCount()
             self.journal_progress_table.insertRow(row)
@@ -4583,14 +5514,16 @@ class MainWindow(QMainWindow):
             reviewed_item = QTableWidgetItem(str(reviewed_count))
             reviewed_percent_item = QTableWidgetItem(f"{reviewed_percent_value}%")
 
-            for item in (
+            items = [
                 total_item,
                 done_item,
                 exported_percent_item,
                 to_review_item,
                 reviewed_item,
                 reviewed_percent_item,
-            ):
+            ]
+
+            for item in items:
                 item.setTextAlignment(Qt.AlignCenter)
 
             set_percent_cell_background(exported_percent_item, exported_percent)
@@ -4604,6 +5537,19 @@ class MainWindow(QMainWindow):
             self.journal_progress_table.setItem(row, 5, reviewed_item)
             self.journal_progress_table.setItem(row, 6, reviewed_percent_item)
 
+            if show_final_stats:
+                to_final_review_count = max(reviewed_count - final_reviewed_count, 0)
+                to_final_review_item = QTableWidgetItem(str(to_final_review_count))
+                final_reviewed_item = QTableWidgetItem(str(final_reviewed_count))
+                final_percent_item = QTableWidgetItem(f"{final_reviewed_percent_value}%")
+                to_final_review_item.setTextAlignment(Qt.AlignCenter)
+                final_reviewed_item.setTextAlignment(Qt.AlignCenter)
+                final_percent_item.setTextAlignment(Qt.AlignCenter)
+                set_percent_cell_background(final_percent_item, final_reviewed_percent_value)
+                self.journal_progress_table.setItem(row, 7, to_final_review_item)
+                self.journal_progress_table.setItem(row, 8, final_reviewed_item)
+                self.journal_progress_table.setItem(row, 9, final_percent_item)
+
         self.journal_progress_table.blockSignals(False)
         self.journal_progress_table.setUpdatesEnabled(True)
 
@@ -4614,6 +5560,7 @@ class MainWindow(QMainWindow):
         self.journal_progress_table.setMinimumHeight(table_height)
         self.journal_frame.setMinimumHeight(table_height + 110)
 
+        rating_mode = self.get_rating_mode()
         for index, month_value in enumerate(rating_months):
             if index < len(self.rating_month_title_labels):
                 self.rating_month_title_labels[index].setText(
@@ -4621,9 +5568,9 @@ class MainWindow(QMainWindow):
                 )
 
             if index < len(self.rating_month_rank_labels):
-                ranking_rows = self.get_month_ranking(month_value)
+                ranking_rows = self.get_month_ranking(month_value, mode=rating_mode)
                 self.rating_month_rank_labels[index].setText(
-                    self.format_month_ranking_text(ranking_rows)
+                    self.format_month_ranking_text(ranking_rows, mode=rating_mode)
                 )
 
     def closeEvent(self, event):
