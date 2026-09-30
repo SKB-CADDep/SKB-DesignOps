@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QComboBox, QMessageBox,
     QTabWidget, QFileDialog, QProgressBar, QLineEdit, QSpinBox, QFrame,
     QAbstractItemView, QInputDialog, QHeaderView, QListWidget, QDialog,
-    QButtonGroup, QRadioButton,
+    QButtonGroup, QRadioButton, QScrollArea, QSizePolicy,
 )
 from PySide6.QtGui import QColor
 from PySide6.QtCore import Qt, QTimer
@@ -451,7 +451,7 @@ MONTH_NAMES_RU = {
     12: "Декабрь",
 }
 
-APP_VERSION = "1.1.4"
+APP_VERSION = "1.1.6"
 VERSIONS_DIR_NAME = "versions"
 VERSION_CONFIG_NAME = "version.json"
 UPDATE_CHECK_INTERVAL_MS = 5 * 60 * 1000
@@ -549,7 +549,7 @@ def init_db():
         except OSError:
             pass  # файлы заняты другим процессом — оставляем
 
-    backup_db()  # бэкап перед инициализацией
+    backup_db()  # бэкап не чаще раза в BACKUP_INTERVAL_HOURS
     conn = get_db_connection()
     cur = conn.cursor()
 
@@ -873,27 +873,40 @@ def init_db():
     conn.commit()
     conn.close()
 
-    # Проверка целостности: если БД пустая — возможно, это локальный мусор
+    # Если таблицы так и не появились (например, был пустой/битый файл) —
+    # пробуем ещё раз создать схему, НЕ удаляя файл молча.
     check_conn = sqlite3.connect(DB_PATH, timeout=5)
     check_cur = check_conn.cursor()
-    check_cur.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='issues'")
+    check_cur.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='issues'"
+    )
     has_issues_table = check_cur.fetchone()[0] > 0
+    check_cur.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='export_issues'"
+    )
+    has_export_table = check_cur.fetchone()[0] > 0
+    try:
+        integrity = check_cur.execute("PRAGMA integrity_check").fetchone()[0]
+    except sqlite3.DatabaseError as exc:
+        integrity = str(exc)
     check_conn.close()
 
-    if not has_issues_table:
-        # БД существует, но таблиц нет — удаляем и пересоздаём
-        try:
-            Path(DB_PATH).unlink()
-        except OSError:
-            pass
-        # Пересоздаём с нуля
-        conn = get_db_connection()
-        cur = conn.cursor()
-        # ... (здесь нужно создать все таблицы заново)
-        # Но проще — вызвать init_db рекурсивно
-        conn.close()
-        init_db()
-        return
+    if not has_issues_table or not has_export_table:
+        raise sqlite3.OperationalError(
+            "В базе данных отсутствуют обязательные таблицы "
+            f"(issues={has_issues_table}, export_issues={has_export_table}).\n"
+            f"Файл: {DB_PATH}\n"
+            "Возможно, journal_app.db пустой или повреждён после восстановления.\n"
+            "Восстановите файл из backups / journal_app_broken.db и перезапустите."
+        )
+
+    if integrity != "ok":
+        raise sqlite3.DatabaseError(
+            f"База данных повреждена (integrity_check: {integrity}).\n"
+            f"Файл: {DB_PATH}\n"
+            "Не продолжайте работу с этим файлом — восстановите из копии."
+        )
+
 
 _db_access_checked = False
 
@@ -926,6 +939,15 @@ def ensure_db_dir():
 
 def get_db_connection():
     ensure_db_dir()
+    db_path = Path(DB_PATH)
+    # Нулевой файл — это не БД, а обломок после неудачного копирования/восстановления.
+    if db_path.exists() and db_path.stat().st_size == 0:
+        raise sqlite3.OperationalError(
+            f"Файл базы данных пустой (0 байт):\n{DB_PATH}\n\n"
+            "Скорее всего journal_app.db был перезаписан при восстановлении.\n"
+            "Замените его рабочей копией (backups / journal_app_broken.db) "
+            "и перезапустите программу."
+        )
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA journal_mode = DELETE")
@@ -935,37 +957,108 @@ def get_db_connection():
 
 # ================= БЭКАП БД =================
 
-BACKUP_MAX_COUNT = 10
+BACKUP_MAX_COUNT = 28  # ~2 недели при бэкапе 2 раза в день
+BACKUP_INTERVAL_HOURS = 12  # не чаще одного бэкапа раз в 12 часов
 
 
-def backup_db():
-    """Создаёт бэкап БД с датой/временем в имени. Хранит не более BACKUP_MAX_COUNT копий."""
-    if not Path(DB_PATH).exists():
-        return
-
-    backup_dir = DB_DIR / "backups"
-    backup_dir.mkdir(parents=True, exist_ok=True)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_name = f"journal_app_backup_{timestamp}.db"
-    backup_path = backup_dir / backup_name
-
-    try:
-        shutil.copy2(DB_PATH, backup_path)
-    except OSError:
-        return  # тихо пропускаем, если нет доступа
-
-    # Ротация: оставляем только последние BACKUP_MAX_COUNT
-    existing = sorted(
+def list_db_backups(backup_dir=None):
+    backup_dir = Path(backup_dir or (DB_DIR / "backups"))
+    if not backup_dir.exists():
+        return []
+    return sorted(
         backup_dir.glob("journal_app_backup_*.db"),
         key=lambda p: p.stat().st_mtime,
-        reverse=True
+        reverse=True,
     )
+
+
+def should_create_db_backup(backup_dir=None):
+    """True, если с последнего бэкапа прошло не меньше BACKUP_INTERVAL_HOURS."""
+    existing = list_db_backups(backup_dir)
+    if not existing:
+        return True
+
+    latest = existing[0]
+    try:
+        age_seconds = datetime.now().timestamp() - latest.stat().st_mtime
+    except OSError:
+        return True
+    return age_seconds >= BACKUP_INTERVAL_HOURS * 3600
+
+
+def rotate_db_backups(backup_dir=None):
+    existing = list_db_backups(backup_dir)
     for old in existing[BACKUP_MAX_COUNT:]:
         try:
             old.unlink()
         except OSError:
             pass
+
+
+def create_db_backup_file(backup_path):
+    """Копирует БД через SQLite Backup API; fallback — shutil.copy2."""
+    backup_path = Path(backup_path)
+    src = None
+    dst = None
+    try:
+        src = sqlite3.connect(f"file:{Path(DB_PATH).as_posix()}?mode=ro", uri=True)
+        dst = sqlite3.connect(backup_path)
+        src.backup(dst)
+        dst.commit()
+        check = dst.execute("PRAGMA integrity_check").fetchone()[0]
+        if check != "ok":
+            raise sqlite3.DatabaseError(f"backup integrity_check failed: {check}")
+        return
+    except (sqlite3.Error, OSError):
+        if dst is not None:
+            try:
+                dst.close()
+            except sqlite3.Error:
+                pass
+            dst = None
+        if backup_path.exists():
+            try:
+                backup_path.unlink()
+            except OSError:
+                pass
+        shutil.copy2(DB_PATH, backup_path)
+    finally:
+        if dst is not None:
+            try:
+                dst.close()
+            except sqlite3.Error:
+                pass
+        if src is not None:
+            try:
+                src.close()
+            except sqlite3.Error:
+                pass
+
+
+def backup_db(force=False):
+    """Создаёт бэкап БД не чаще раза в BACKUP_INTERVAL_HOURS (если force=False)."""
+    if not Path(DB_PATH).exists() or Path(DB_PATH).stat().st_size == 0:
+        return
+
+    backup_dir = DB_DIR / "backups"
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+
+    if not force and not should_create_db_backup(backup_dir):
+        return
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = backup_dir / f"journal_app_backup_{timestamp}.db"
+
+    try:
+        create_db_backup_file(backup_path)
+    except OSError:
+        return
+
+    rotate_db_backups(backup_dir)
+
 
 def extract_issue_metadata_from_pdf(pdf_path):
     pdf_path = Path(pdf_path)
@@ -3168,67 +3261,6 @@ class MainWindow(QMainWindow):
 
         filter_frame_layout.addLayout(filter_layout)
 
-        # ================= СТАТИСТИКА ВЫГРУЗКИ =================
-        self.export_stats_frame = QFrame()
-        self.export_stats_frame.setObjectName("ratingCard")
-        stats_layout = QVBoxLayout(self.export_stats_frame)
-
-        stats_title = QLabel("Статистика выгрузки")
-        stats_title.setStyleSheet("font-weight: 700; font-size: 14px; color: #1f2937;")
-
-        self.export_summary_label = QLabel()
-        self.export_summary_label.setWordWrap(True)
-        self.export_summary_label.setStyleSheet("font-size: 14px;")
-
-        self.export_progress_table = QTableWidget()
-        self.export_progress_table.setColumnCount(4)
-        self.export_progress_table.setHorizontalHeaderLabels(
-            ["Журнал", "Выгружено", "Всего", "%"]
-        )
-        self.export_progress_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.export_progress_table.setSelectionMode(QAbstractItemView.NoSelection)
-        self.export_progress_table.setFocusPolicy(Qt.NoFocus)
-        self.export_progress_table.setAlternatingRowColors(True)
-        self.export_progress_table.setShowGrid(False)
-        self.export_progress_table.setWordWrap(False)
-        self.export_progress_table.setTextElideMode(Qt.ElideRight)
-        self.export_progress_table.verticalHeader().setVisible(False)
-        self.export_progress_table.verticalHeader().setDefaultSectionSize(28)
-
-        self.export_progress_table.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
-
-        self.export_stats_frame.setMinimumWidth(380)
-        self.export_progress_table.setMinimumWidth(360)
-        self.export_progress_table.setStyleSheet("""
-            QTableWidget {
-                background-color: #ffffff;
-                alternate-background-color: #f7f7f7;
-            }
-            QHeaderView::section {
-                background-color: #e9eef5;
-                color: #1f2937;
-                padding: 6px 8px;
-                border: 1px solid #d7dde5;
-                font-weight: bold;
-            }
-            QTableWidget::item:selected {
-                background-color: #0078d7;
-                color: white;
-            }
-            QTableWidget::item:selected:active {
-                background-color: #0078d7;
-                color: white;
-            }
-        """)
-        apply_static_column_widths(
-            self.export_progress_table,
-            RATING_PROGRESS_COLUMN_SAMPLES,
-        )
-
-        stats_layout.addWidget(stats_title)
-        stats_layout.addWidget(self.export_summary_label)
-        stats_layout.addWidget(self.export_progress_table)
-
         # ================= КАРТОЧКА ТАБЛИЦЫ =================
         self.export_table_frame = QFrame()
         self.export_table_frame.setObjectName("ratingCard")
@@ -3297,13 +3329,7 @@ class MainWindow(QMainWindow):
         self.load_export_journal_filter_options()
 
         layout.addWidget(self.export_filter_frame)
-
-        content_layout = QHBoxLayout()
-        content_layout.setSpacing(10)
-        content_layout.addWidget(self.export_table_frame, 3)
-        content_layout.addWidget(self.export_stats_frame, 2)
-
-        layout.addLayout(content_layout)
+        layout.addWidget(self.export_table_frame)
 
         self.export_tab.setLayout(layout)
 
@@ -3437,74 +3463,6 @@ class MainWindow(QMainWindow):
         index = self.export_journal_filter_box.findText(current)
         self.export_journal_filter_box.setCurrentIndex(index if index >= 0 else 0)
         self.export_journal_filter_box.blockSignals(False)
-
-    def update_export_progress_table(self):
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        cur.execute("""
-            SELECT COUNT(*),
-                   COALESCE(SUM(CASE WHEN status='done' THEN 1 ELSE 0 END), 0)
-            FROM export_issues
-        """)
-        total_row = cur.fetchone() or (0, 0)
-        total_count = total_row[0] or 0
-        done_count = total_row[1] or 0
-        percent_total = int((done_count / total_count) * 100) if total_count else 0
-
-        cur.execute("""
-            SELECT journal,
-                   SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS done_count,
-                   COUNT(*) AS total_count
-            FROM export_issues
-            GROUP BY journal
-            ORDER BY journal COLLATE NOCASE
-        """)
-        journal_rows = cur.fetchall()
-        conn.close()
-
-        self.export_summary_label.setText(
-            f"Всего: {total_count} | Выгружено: {done_count} | Прогресс: {percent_total}%"
-        )
-
-        self.export_progress_table.setRowCount(0)
-        self.export_progress_table.setUpdatesEnabled(False)
-        self.export_progress_table.blockSignals(True)
-
-        for journal, done_count, total_count in journal_rows:
-            journal_name = journal or "Без названия"
-            percent = int((done_count / total_count) * 100) if total_count else 0
-
-            row = self.export_progress_table.rowCount()
-            self.export_progress_table.insertRow(row)
-            self.export_progress_table.setRowHeight(row, 28)
-
-            journal_item = QTableWidgetItem(journal_name)
-            journal_item.setToolTip(journal_name)
-            journal_item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-
-            done_item = QTableWidgetItem(str(done_count))
-            total_item = QTableWidgetItem(str(total_count))
-            percent_item = QTableWidgetItem(f"{percent}%")
-
-            done_item.setTextAlignment(Qt.AlignCenter)
-            total_item.setTextAlignment(Qt.AlignCenter)
-            percent_item.setTextAlignment(Qt.AlignCenter)
-
-            if percent >= 80:
-                percent_item.setBackground(QColor("#d4edda"))
-            elif percent >= 50:
-                percent_item.setBackground(QColor("#fff3cd"))
-            else:
-                percent_item.setBackground(QColor("#f8d7da"))
-
-            self.export_progress_table.setItem(row, 0, journal_item)
-            self.export_progress_table.setItem(row, 1, done_item)
-            self.export_progress_table.setItem(row, 2, total_item)
-            self.export_progress_table.setItem(row, 3, percent_item)
-
-        self.export_progress_table.blockSignals(False)
-        self.export_progress_table.setUpdatesEnabled(True)
 
     def get_export_issue_lock_info(self, issue_id):
         conn = get_db_connection()
@@ -3677,7 +3635,6 @@ class MainWindow(QMainWindow):
         ):
             if row >= 0:
                 self.export_table.removeRow(row)
-            self.update_export_progress_table()
             return
 
         if row < 0:
@@ -3778,8 +3735,6 @@ class MainWindow(QMainWindow):
             self.set_completed_at_cell(self.export_table, row, id_, completed_at, status)
         finally:
             self.export_table.blockSignals(False)
-
-        self.update_export_progress_table()
 
     def load_export_data(self):
         scroll_value = self.export_table.verticalScrollBar().value() if self._preserve_export_scroll_on_reload else 0
@@ -3974,8 +3929,6 @@ class MainWindow(QMainWindow):
 
         if self._preserve_export_scroll_on_reload:
             self.export_table.verticalScrollBar().setValue(scroll_value)
-
-        self.update_export_progress_table()
 
     def delete_selected_export_issue(self):
         if not self.is_admin:
@@ -5239,7 +5192,9 @@ class MainWindow(QMainWindow):
         self.rating_mode_review_radio.setProperty("rating_mode", "review")
         self.rating_mode_group.addButton(self.rating_mode_export_radio)
         self.rating_mode_group.addButton(self.rating_mode_review_radio)
-        self.rating_mode_group.buttonClicked.connect(lambda _button: self.update_rating())
+        self.rating_mode_group.buttonClicked.connect(
+            lambda _button: self.update_rating_board()
+        )
 
         board_header.addWidget(self.rating_mode_export_radio)
         board_header.addWidget(self.rating_mode_review_radio)
@@ -5299,23 +5254,31 @@ class MainWindow(QMainWindow):
             rank_label.setWordWrap(True)
             rank_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
             rank_label.setStyleSheet("font-size: 13px;")
+            rank_label.setMinimumHeight(140)
+            rank_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
             self.rating_month_rank_labels.append(rank_label)
-            column_layout.addWidget(rank_label)
+            column_layout.addWidget(rank_label, 1)
 
-            columns_layout.addWidget(column_frame)
+            columns_layout.addWidget(column_frame, 1)
 
         board_layout.addLayout(columns_layout)
 
-        left_content_layout = QVBoxLayout()
-        left_content_layout.addWidget(self.journal_frame)
-        left_content_layout.addStretch()
+        scroll_content = QWidget()
+        scroll_content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        content_layout = QVBoxLayout(scroll_content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(10)
+        content_layout.addWidget(self.journal_frame)
+        content_layout.addWidget(self.rating_board_frame)
 
-        content_layout = QHBoxLayout()
-        content_layout.addLayout(left_content_layout, 1)
-        content_layout.addWidget(self.rating_board_frame, 1)
-        content_layout.setAlignment(self.rating_board_frame, Qt.AlignTop)
+        self.rating_scroll_area = QScrollArea()
+        self.rating_scroll_area.setWidgetResizable(True)
+        self.rating_scroll_area.setFrameShape(QFrame.NoFrame)
+        self.rating_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.rating_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.rating_scroll_area.setWidget(scroll_content)
 
-        layout.addLayout(content_layout)
+        layout.addWidget(self.rating_scroll_area)
 
         self.rating_tab.setLayout(layout)
 
@@ -5452,12 +5415,6 @@ class MainWindow(QMainWindow):
             self.plan_count_spin.setValue(plan_count)
             self.plan_count_spin.blockSignals(False)
 
-        if self.is_admin and hasattr(self, "rating_month_edits"):
-            for edit, month_value in zip(self.rating_month_edits, rating_months):
-                edit.blockSignals(True)
-                edit.setText(month_value)
-                edit.blockSignals(False)
-
         self.plan_summary_label.setText(
             f"Месяц: {month} | План: {plan_count} | Факт: {month_done} | "
             f"Осталось: {month_remaining} | Выполнение: {month_percent}%"
@@ -5558,7 +5515,29 @@ class MainWindow(QMainWindow):
         header_height = self.journal_progress_table.horizontalHeader().height()
         table_height = header_height + rows_count * row_height + 8
         self.journal_progress_table.setMinimumHeight(table_height)
-        self.journal_frame.setMinimumHeight(table_height + 110)
+        self.journal_progress_table.setMaximumHeight(table_height)
+
+        self.update_rating_board(rating_months=rating_months)
+
+    def update_rating_board(self, rating_months=None):
+        """Обновляет только блок «Рейтинг по месяцам» (без пересборки статистики журналов)."""
+        if not hasattr(self, "rating_month_rank_labels"):
+            return
+
+        scroll_value = 0
+        if hasattr(self, "rating_scroll_area"):
+            scroll_value = self.rating_scroll_area.verticalScrollBar().value()
+
+        if rating_months is None:
+            rating_months = self.get_rating_months()
+
+        if self.is_admin and hasattr(self, "rating_month_edits"):
+            for edit, month_value in zip(self.rating_month_edits, rating_months):
+                if edit.hasFocus():
+                    continue
+                edit.blockSignals(True)
+                edit.setText(month_value)
+                edit.blockSignals(False)
 
         rating_mode = self.get_rating_mode()
         for index, month_value in enumerate(rating_months):
@@ -5572,6 +5551,12 @@ class MainWindow(QMainWindow):
                 self.rating_month_rank_labels[index].setText(
                     self.format_month_ranking_text(ranking_rows, mode=rating_mode)
                 )
+
+        if hasattr(self, "rating_scroll_area"):
+            QTimer.singleShot(
+                0,
+                lambda: self.rating_scroll_area.verticalScrollBar().setValue(scroll_value),
+            )
 
     def closeEvent(self, event):
         """Корректно закрываем соединение при выходе"""
@@ -5591,7 +5576,7 @@ if __name__ == "__main__":
         try:
             init_db()
             break
-        except sqlite3.OperationalError as exc:
+        except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
             if attempt == max_retries - 1:
                 app = QApplication(sys.argv)
                 QMessageBox.critical(
@@ -5601,7 +5586,9 @@ if __name__ == "__main__":
                     f"Путь: {DB_PATH}\n\n"
                     f"1. Проверьте, что файловый сервер доступен.\n"
                     f"2. Проверьте права на запись в папку.\n"
-                    f"3. Попробуйте перезапустить программу.\n\n"
+                    f"3. Если файл journal_app.db пустой или повреждён — "
+                    f"восстановите его из backups.\n"
+                    f"4. Попробуйте перезапустить программу.\n\n"
                     f"Техническая ошибка:\n{exc}"
                 )
                 sys.exit(1)
